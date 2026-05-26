@@ -1,0 +1,10 @@
+torch>=1.13
+torchio>=0.18
+numpy
+pandas
+nibabel
+scipy
+commentjson
+filelock
+
+# TODO udpate or remove
