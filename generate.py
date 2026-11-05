@@ -7,13 +7,11 @@ import csv
 import logging
 import os
 import os.path as op
-import sys
 import tempfile
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple, Union
-
 import commentjson
 import nibabel as nib
 import numpy as np
@@ -28,13 +26,16 @@ import transforms_class as tf
 from transforms_class import (
     OneHotTransform,
 )
-from transforms_class import RandomMorphologyTransform, RandomLabelsToImageOneConstraint, LabelTransform
+from transforms_class import RandomMorphologyTransform, RandomLabelsToImageConstraint, LabelTransform
+from transforms_class.RandomPerlinIntensity import RandomPerlinIntensity
+from transforms_class.transformPipeline import TransformPipeline
 from utils.json import ArrayTensorJSONEncoder
-from utils.logger import BLUE, GREEN, RESET, YELLOW, RED, configure_logging
+from utils.logger import BLUE, GREEN, RESET, RED, configure_logging
 
 # Configure logging
 logger = logging.getLogger(__name__)
 configure_logging(dev_mode=True, module_name=__name__)
+
 # -----------------------------------------------------------------------------
 # Data types
 # -----------------------------------------------------------------------------
@@ -152,6 +153,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--get_label_only",
         help="If set, only generate labels without synthetic images",
+        action="store_true",
+    )
+    
+    parser.add_argument(
+        "--get_nb_subjects",
+        help="If set, only return the number of subjects in the dataset",
         action="store_true",
     )
     return parser.parse_args()
@@ -273,7 +280,7 @@ def load_config(
             else:
                 raise ValueError(f"Config file must have an [anomalies] section with keys for each anomaly type, but got {cfgp.sections()}")
 
-            if transforms["anomalies"] is None or len(transforms["anomalies"].transforms) == 0:
+            if transforms["anomalies"] is None or (isinstance(transforms["anomalies"], list) and len(transforms["anomalies"]) == 0) or (hasattr(transforms["anomalies"], "transforms") and len(transforms["anomalies"].transforms) == 0):
                 raise ValueError(f"Anomalies transform for anomaly type {anomalies_num} is empty or not found in config.")
 
     # Dataset config
@@ -297,6 +304,7 @@ def load_config(
         "pre_pool_after_preproc_dilate": int(model_config.get("pre_pool_after_preproc_dilate", "0")),
         "directory_path_add_subregions": model_config.get("directory_path_add_subregions", ""),
         "add_subregions_lab": parse_config_list(model_config.get("add_subregions_lab", "")),
+        "stratified_column": model_config.get("stratified_column", "Stratified_Tissue_Region"),
     }
     
 
@@ -343,9 +351,6 @@ def get_label_set_config(label_set_num: int, dataset: Dict) -> Tuple[
     #remove nan, due to empty element, for allen and bigbrain, where we add in the
     #NametargetRegV4 missing labels (skull head vasc dura), so we need to skep them
     # when reading other mapping
-    def isnotNaN(num):
-        return num == num
-
     label_set_name = dataset["label_set_name"]
     synth_col = dataset["synth_col"]
 
@@ -371,7 +376,7 @@ def get_label_set_config(label_set_num: int, dataset: Dict) -> Tuple[
 
     # Link the names of tissue groups to the names of the regions that compose these tissue groups
     label_name_few_to_label_name_all = (
-        df.groupby("Stratified_Tissue_Region")[label_name_column]
+        df.groupby(dataset["stratified_column"])[label_name_column]
         .apply(set)
         .apply(list)
         .dropna()
@@ -544,11 +549,26 @@ def pool_remap(
 # -----------------------------------------------------------------------------
 
 
+def _serialize_history_entry(entry) -> dict:
+    """Convert a history entry (dict or transform object) to a plain serializable dict."""
+    if isinstance(entry, dict):
+        return {k: str(v) if callable(v) else v for k, v in entry.items()}
+    # TorchIO transform object
+    name = entry.name
+    params = {"name": name}
+    for arg in entry.args_names:
+        v = getattr(entry, arg)
+        params[arg] = str(v) if callable(v) else v
+    return params
+
+
 def record_history(
     sample: tio.Subject, idx: Optional[int] = None
 ) -> Dict[str, Union[List, str]]:
     """
     Extract TorchIO transform history and metrics into a dict.
+    Also includes per-stage history from full_history (preprocessing, anomalies,
+    spatial, downsampling, label_to_image_intensity) when available.
     """
     infos: Dict[str, Union[List, str]] = {}
 
@@ -597,6 +617,43 @@ def record_history(
     if "anomaly_type" in sample:
         infos["order"] += f'_Ano{sample["anomaly_type"]}'
 
+    # -----------------------------------------------------------------------
+    # Per-stage full_history (preprocessing, anomalies, spatial, …)
+    # -----------------------------------------------------------------------
+    full_history = getattr(sample, "full_history", None)
+    if full_history:
+        for stage_name, stage_data in full_history.items():
+            stage_history = stage_data.get("history", [])
+            stage_metrics = stage_data.get("metrics", [])
+            # Flatten nested metric lists
+            if len(stage_metrics) == 1 and isinstance(stage_metrics[0], list):
+                stage_metrics = stage_metrics[0]
+
+            # Serialize history entries to plain dicts before JSON-dumping
+            serializable_history = [_serialize_history_entry(e) for e in stage_history]
+            infos[f"stage_{stage_name}_history"] = commentjson.dumps(
+                serializable_history, cls=ArrayTensorJSONEncoder
+            )
+            infos[f"stage_{stage_name}_metrics"] = commentjson.dumps(
+                stage_metrics, cls=ArrayTensorJSONEncoder
+            )
+            # Per-transform details for this stage
+            stage_counts: Dict[str, int] = {}
+            for entry in stage_history:
+                name = entry["name"] if isinstance(entry, dict) else entry.name
+                params = {}
+                items = (
+                    entry.items()
+                    if isinstance(entry, dict)
+                    else [(arg, getattr(entry, arg)) for arg in entry.args_names]
+                )
+                for k, v in items:
+                    params[k] = str(v) if callable(v) else v
+                key = f"stage_{stage_name}_T_{name}"
+                stage_counts[key] = stage_counts.get(key, 0) + 1
+                sfx = f"_{stage_counts[key]}" if stage_counts[key] > 1 else ""
+                infos[f"{key}{sfx}"] = commentjson.dumps(params, cls=ArrayTensorJSONEncoder)
+
     # Add image path in csv
     for image_key in sample.keys():
         if isinstance(sample[image_key], tio.data.image.LabelMap):
@@ -637,7 +694,7 @@ def parse_transform(defn: Union[Dict, List]) -> tio.Transform:
     ----------
     defn : dict or list
         The transform definition, which can be:
-        - A list of transform definitions (for Compose)
+        - A list of transform definitions (for TransformPipeline)
         - A dict with keys "name", "attributes", and optionally "transforms" for nested transforms.
     
     Returns
@@ -645,9 +702,9 @@ def parse_transform(defn: Union[Dict, List]) -> tio.Transform:
     tio.Transform
         The parsed TorchIO transform pipeline corresponding to the definition.
     """
-    # Convert List to Compose
+    # Convert List to TransformPipeline
     if isinstance(defn, list):
-        return tio.Compose([parse_transform(d) for d in defn])
+        return TransformPipeline([parse_transform(d) for d in defn])
 
     # Resolve class
     try:
@@ -667,6 +724,7 @@ def parse_transform(defn: Union[Dict, List]) -> tio.Transform:
 
     # Case : Compose
     if name == "Compose":
+        raise ValueError("Compose should be defined as a list of transforms, not as a dict with 'transforms' key.")
         transforms = [parse_transform(t) for t in (children or [])]
         return cls(transforms, **attrs)
 
@@ -797,7 +855,7 @@ def add_subregions_labels(
         # Remap the label map to target IDs
         dict_remap = dict(zip(df_add[label_col], target_ids))
         label_map_image = tio.RemapLabels(dict_remap)(label_to_add_image)
-        
+
         if torch.all(label_map_image.data[mask_add] == 0):
             raise ValueError(f"No assigned value in dilation mask for {lab}")
 
@@ -884,26 +942,20 @@ def resolve_transform_anatomies(
         for t in transform.transforms_dict.keys():
             resolve_transform_anatomies(t, label_name_to_value, label_name_few_to_label_name_all, synth_map)
         return transform
-
-    # ---- Case Transform ----
-
-    if isinstance(transform, LabelTransform):
-        if not isinstance(transform, RandomMorphologyTransform):
-            # Remapping on the final tissue directly
-            transform.resolve_anatomy(label_name_few_to_label_name_all)
-        transform.resolve_anatomy(label_name_to_value)
-
     # ---- Case LabelToImageConstraint ----
-    if isinstance(transform, RandomLabelsToImageOneConstraint):
+    elif isinstance(transform, (RandomLabelsToImageConstraint, RandomPerlinIntensity)):
         transform.resolve_anatomy(label_name_few_to_label_name_all)
-        for key, values in transform.contrasted_labels.items():
-            if isinstance(values, list) and "tumor_edema" in values:
-                #Remove value that does not contains "edema" (because we want to contrast only the edema part if both are present)
-                transform.contrasted_labels[key] = [v for v in values if "edema" in v]
-
-
+        
         transform.resolve_anatomy(label_name_to_value)
         transform.resolve_anatomy(synth_map)
+
+    # ---- Case Transform ----
+    elif isinstance(transform, LabelTransform):
+        if not isinstance(transform, (RandomMorphologyTransform)):
+            # Remapping on the final tissue directly
+            transform.resolve_anatomy(label_name_few_to_label_name_all)
+
+        transform.resolve_anatomy(label_name_to_value)
 
     return transform
 
@@ -912,6 +964,22 @@ def reduce_resolution(
     subject_spatial: tio.Subject,
     nb_pool: int
 ) -> Tuple[tio.Subject, tio.LabelMap]:
+    """
+    Downsample (pool) a subject's label map and remap labels if needed.
+
+    - Remap les labels selon target_map si besoin
+    - Pool la carte de labels (binaire et multi-classes)
+    - Gère aussi le label sans lésion si présent
+    - Copie les attributs utiles (anomalies_labels, suffix)
+
+    Args:
+        target_map: dict de remapping label->label
+        subject_spatial: subject torchio avec .label
+        nb_pool: facteur de pooling
+
+    Returns:
+        subject_down: subject torchio avec labels poolés
+    """
     # Remap target, only if needed
     if list(target_map.keys()) == list(target_map.values()):
         target_image = subject_spatial.label
@@ -923,7 +991,7 @@ def reduce_resolution(
     label_bin, label_4d = pool_remap(target_image, pooling_size=nb_pool, ensure_multiple=nb_pool*2)
     subject_down = tio.Subject(label=label_4d, label_bin=label_bin)
 
-    #down sample the label without lesion too
+    # Down sample the label without lesion too
     if "__label_without_lesion" in subject_spatial:
         if list(target_map.keys()) == list(target_map.values()):
             target_image = subject_spatial.__label_without_lesion
@@ -936,57 +1004,44 @@ def reduce_resolution(
     # herite from extra attribute (used after in label_2_image
     if "anomalies_labels" in subject_spatial:
         subject_down["anomalies_labels"] = subject_spatial["anomalies_labels"]
+
+    if "contrasted_lesion_labels_to_remove" in subject_spatial:
+        subject_down["contrasted_lesion_labels_to_remove"] = subject_spatial["contrasted_lesion_labels_to_remove"]
+
     if "suffix" in subject_spatial:
         subject_down["suffix"] = subject_spatial["suffix"]
 
 
     return subject_down
 
-def label_2_image(
-    transforms: List[tio.Transform],
-    subject_down: tio.Subject,
-    synth_map: Dict[int, int],
+
+def setup_name_map_current(
     label_name_to_value: Dict[str, int],
-) -> tio.Subject:
+    preprocessing_target_map: Optional[Dict[int, int]],
+    label_img: tio.LabelMap
+) -> Tuple[Dict[str, int], tio.LabelMap]:
     """
-    Apply label-to-image synthesis and pooling to generate synthetic MRI and label maps.
+    Prepare the current name map for label processing, handling special cases for vascular datasets.
+
+    This function creates a mapping from region names to label values, optionally using a preprocessing target map.
+    For vascular datasets, it remaps left and right GM (gray matter) to a single GM label if needed.
 
     Parameters
     ----------
-    transforms : List[tio.Transform]
-        TorchIO transforms to generate synthetic intensities from labels.
-    subject_down : tio.Subject
-        Subject after spatial transforms (input for synthesis and remapping).
-    synth_map : Dict[int, int]
-        Mapping from input label values to synthetic tissue classes (for intensity synthesis).
-    label_name_to_value : Dict[str, int]
-        Mapping from anatomical names (e.g. 'WM') to label values (used for contrast).
+    label_name_to_value : dict
+        Mapping from region names to label values.
+    preprocessing_target_map : dict or None
+        Optional preprocessing target map (tuple of dicts) for remapping.
+    label_img : tio.LabelMap
+        The label image object (may be modified).
 
     Returns
     -------
-    Tuple[tio.Subject, tio.Subject, tio.LabelMap, tio.LabelMap]
-        subject_img : tio.Subject
-            Subject with synthetic image (before pooling).
-        subject_down : tio.Subject
-            Subject with pooled synthetic image.
-        label_bin : tio.LabelMap
-            Pooled binary label map.
-        label_4d : tio.LabelMap
-            Pooled multi-channel label map.
-
-    """
-
-    # Label to image transform
-    # ------------------------
-    subject_synth = tio.RemapLabels(synth_map)(subject_down)
-    subject_img = transforms(subject_synth)
-
-    return subject_img
-
-def setup_name_map_current(label_name_to_value, preprocessing_target_map, label_img):
-    """
-    Prepare the current name map, handling special case for vascular datasets (remap lGM/rGM to GM).
-    Returns (name_map_current, label_img)
+    Tuple[dict, tio.LabelMap]
+        name_map_current : dict
+            The prepared mapping from region names to label values.
+        label_img : tio.LabelMap
+            The (possibly updated) label image.
     """
     name_map_current = label_name_to_value.copy() if preprocessing_target_map is None else preprocessing_target_map[0].copy()
     if preprocessing_target_map is not None:
@@ -998,89 +1053,88 @@ def setup_name_map_current(label_name_to_value, preprocessing_target_map, label_
     name_map_current = dict(sorted(name_map_current.items(), key=lambda item: item[1]))
     return name_map_current, label_img
     
-def generate_one_subject(
-    sujname: str,
-    label_file: str,
-    transforms: Dict[str, tio.Transform],
-    label_name_to_value: Dict[str, int],
-    synth_map: Dict[int, int],
-    target_map: Dict[int, int],
-    preprocessing_target_map: Dict[int, int],
-    output_name: str,
-    output_dir: str = ".",
-    add_subregions: bool = True,
-    directory_path_add_subregions: str = "",
-    add_subregions_lab: List[str] = None,
-    nb_pool: int = 3,
-    pre_pool_after_preproc_dilate: int = 0,
-    nb_out_contrast: int = 1,
-    get_label_only: bool = False,
-    label_name_few_to_label_name_all: Dict[str, str] = None
-) -> tio.Subject:
+def load_subject(
+        label_file: str,
+        label_name_to_value: Dict[str, int],
+        preprocessing_target_map: Optional[Dict[int, int]] = None
+    ) -> Tuple[tio.Subject, Dict[str, int]]:
     """
-    Generate one synthetic subject (image and labels), apply transforms, and save outputs to disk.
+    Load a subject's label image and prepare the name map for label processing.
 
     Parameters
     ----------
-    sujname : str
-        Name of the subject (used for logging).
-
     label_file : str
-        Path to the input label map (.nii.gz).
-
-    transforms : Dict[str, tio.Transform]
-        Dictionary of transforms (keys: 'anomalies', 'spatial', 'label_to_image', 'intensity').
-
-    label_name_to_value : Dict[str, int]
-        Mapping from anatomical structure names (e.g. 'GM', 'WM') to label values.
-
-    synth_map : Dict[int, int]
-        Mapping from label values to synthetic tissue classes (used for intensity generation).
-
-    target_map : Dict[int, int]
-        Mapping from label values to target label values (used for evaluation).
-
-    output_name : str
-        Base name for the output files (without path).
-
-    output_dir : str, optional
-        Output directory where results are saved, by default=current directory.
-
-    add_subregions : bool, optional
-        Whether to add subregion labels, by default=True.
-
-    directory_path_add_subregions : str, optional
-        Directory path where subregion label files are located, by default="".
-
-    add_subregions_lab : List[str], optional
-        List of subregion labels to add, by default=None.
-
-    nb_pool : int, optional
-        Pooling kernel size for downsampling images and labels, by default=3.
-
-    pre_pool_after_preproc_dilate : int, optional
-        label_img = tio.LabelMap(label_file) 
-        name_map_current, label_img = setup_name_map_current(label_name_to_value, preprocessing_target_map, label_img) 
-        
-    label_name_few_to_label_name_all : Dict[str, str], optional
-        Mapping from short label names to full label names (used for remapping in subregions), by default=None.
+        Path to the label image file (.nii.gz).
+    label_name_to_value : dict
+        Mapping from region names to label values.
+    preprocessing_target_map : dict or None
+        Optional preprocessing target map for remapping.
 
     Returns
     -------
-    tio.Subject
-        The transformed subject with anomalies included, for post-processing or tracking.
-
+    Tuple[tio.Subject, dict]
+            subject : tio.Subject
+                The loaded subject with label image.
+            name_map_current : dict
+                The prepared mapping from region names to label values.
     """
-    # -------------------------
-    # Load and preprocess label
-    # Erode and dilate
-    # -------------------------
     label_img = tio.LabelMap(label_file)
     name_map_current, label_img = setup_name_map_current(label_name_to_value, preprocessing_target_map, label_img)
     
     subject = tio.Subject(label=label_img)
     subject["suffix"] = ""
+    
+    return subject, name_map_current
 
+def load_and_preprocess_subject(
+    label_file: str,
+    transforms: Dict[str, tio.Transform],
+    label_name_few_to_label_name_all: Dict[str, str],
+    pre_pool_after_preproc_dilate: int,
+    add_subregions: bool,
+    directory_path_add_subregions: str,
+    add_subregions_lab: List[str],
+    label_name_to_value: Dict[str, int],
+    preprocessing_target_map: Optional[Dict[int, int]]
+) -> tio.Subject:
+    """
+    Preprocess a subject's label image using specified transforms and optionally add subregion labels.
+
+    This function applies preprocessing transforms, handles optional pooling/resampling, and adds subregion labels if requested.
+
+    Parameters
+    ----------
+    subject : tio.Subject
+        The subject to preprocess.
+    transforms : dict
+        Dictionary of preprocessing transforms (must include 'preprocessing').
+    name_map_current : dict
+        Mapping from region names to label values for anatomy resolution.
+    label_name_few_to_label_name_all : dict
+        Mapping from short label names to full label names (for subregions).
+    pre_pool_after_preproc_dilate : int
+        If 2, applies special pooling/resampling for BigBrain dataset.
+    add_subregions : bool
+        Whether to add subregion labels.
+    directory_path_add_subregions : str
+        Directory containing subregion label files.
+    add_subregions_lab : list of str
+        List of subregion labels to add.
+    label_name_to_value : dict
+        Mapping from region names to label values.
+    preprocessing_target_map : dict or None
+        Optional preprocessing target map for remapping.
+
+    Returns
+    -------
+    tio.Subject
+        The preprocessed subject with updated label image.
+    """
+    subject, name_map_current = load_subject(
+        label_file=label_file,
+        label_name_to_value=label_name_to_value,
+        preprocessing_target_map=preprocessing_target_map
+    )
     # -----------------------
     # Preprocessing transform
     # -----------------------
@@ -1091,10 +1145,11 @@ def generate_one_subject(
     preprocessing_transform = resolve_transform_anatomies(
         transforms["preprocessing"], name_map_current, label_name_few_to_label_name_all
     )
-    logger.info("%sResolved anatomies for preprocessing transforms%s", GREEN, RESET)
+    logger.info("%s[GENERATE]%s Resolved anatomies for preprocessing transforms", GREEN, RESET)
     preprocessed_subject = preprocessing_transform(subject)
+
     logger.info(
-        "%sPreprocessing%s done -> suffix %s%s%s",
+        "%s[GENERATE]%s Preprocessing done -> suffix %s%s%s",
         GREEN,
         RESET,
         BLUE,
@@ -1125,7 +1180,43 @@ def generate_one_subject(
         # This ensures both the attribute and the internal dict are consistent, avoiding subtle bugs downstream.
         preprocessed_subject.remove_image('label')
         preprocessed_subject.add_image(label_img, 'label')
+    return preprocessed_subject
 
+def anomalies_subject(
+    preprocessed_subject: tio.Subject,
+    transforms: Dict[str, tio.Transform],
+    label_name_to_value: Dict[str, int],
+    label_name_few_to_label_name_all: Dict[str, str],
+) -> Tuple[tio.Subject, Dict[str, int], Dict[str, str], Dict[int, int]]:
+    """
+    Apply anomaly transforms to a preprocessed subject, if specified.
+
+    This function applies anomaly transforms (if present in the transforms dict) to the subject, updates suffixes,
+    and handles lesion label names and anomaly type attributes.
+
+    Parameters
+    ----------
+    preprocessed_subject : tio.Subject
+        The subject after preprocessing.
+    transforms : dict
+        Dictionary of transforms (may include 'anomalies').
+    label_name_to_value : dict
+        Mapping from region names to label values.
+    label_name_few_to_label_name_all : dict
+        Mapping from short label names to full label names.
+
+    Returns
+    -------
+    Tuple[tio.Subject, dict, dict, dict]
+        subject_anomalies : tio.Subject
+            The subject after anomaly transforms.
+        label_name_to_value : dict
+            Updated mapping from region names to label values.
+        label_name_few_to_label_name_all : dict
+            Updated mapping from short label names to full label names.
+        synth_map : dict
+            Updated mapping from label values to synthetic tissue classes.
+    """
     # -------------------
     # Anomalies transform (optional)
     # -------------------
@@ -1136,33 +1227,16 @@ def generate_one_subject(
         transforms_anomalies = resolve_transform_anatomies(
             transforms["anomalies"], label_name_to_value, label_name_few_to_label_name_all
         )
-        logger.info("%sResolved anatomies for anomalies transforms%s", GREEN, RESET)
-
+        
         subject_anomalies = transforms_anomalies(preprocessed_subject)
         
-        if "lesion_label_names" in subject_anomalies:
-            # Retrieve the lesion label name
-            min_lesion_value = min(subject_anomalies["lesion_label_names"].values())
-            label_names_with_min_value = [k for k, v in label_name_to_value.items() if v == min_lesion_value]
-            
-            # Check that there is exactly one label name with the minimum lesion value
-            if len(label_names_with_min_value) > 1:
-                raise NotImplementedError(f"Multiple lesion labels not supported yet")
-            if len(label_names_with_min_value) == 0:
-                raise ValueError(f"No label with value {min_lesion_value} found in label_name_to_value, needed to assign lesion labels")
-            
-            label_name_to_value.update(subject_anomalies["lesion_label_names"])
-            label_name_few_to_label_name_all[label_names_with_min_value[0]] = list(subject_anomalies["lesion_label_names"].keys())
-            
-            # Remove lesion_label_names from subject_anomalies to avoid confusion later
-            # and also remove the lesion_label from label_name_to_value to avoid confusion with the original lesion label
-            for idx, (_, value) in enumerate(subject_anomalies["lesion_label_names"].items()):
-                if idx == 0:
-                    first_value = synth_map[value]
-                else:
-                    synth_map[value] = first_value + idx
-            label_name_to_value.pop(label_names_with_min_value[0], None)
-
+        if "contrasted_lesion_labels" in subject_anomalies:
+            # Creation de subject_anomalies["contrasted_lesion_labels_to_remove"]
+            subject_anomalies["contrasted_lesion_labels_to_remove"] = []
+            for label_name, value in list(label_name_to_value.items()):
+                if value not in subject_anomalies["contrasted_lesion_labels"] and bool(re.search(r"lesion|tumor|edema", label_name.lower())):
+                    subject_anomalies["contrasted_lesion_labels_to_remove"].append(value)
+    
         if "anomaly_type" in subject_anomalies:
             logger.info("Anomalies transforms to apply: %s%s%s", BLUE, subject_anomalies["anomaly_type"], RESET)
 
@@ -1170,6 +1244,27 @@ def generate_one_subject(
         logger.info("%s==>%s No %sAnomalies%s transforms specified", GREEN, RESET, BLUE, RESET)
         subject_anomalies = preprocessed_subject
 
+    return subject_anomalies, label_name_to_value
+
+def sym_original(
+    output_dir: str,
+    output_name: str,
+    subject_anomalies: tio.Subject,
+    label_file: str):
+    """
+    Create a symlink to the original label file in the output directory for reference.
+
+    Parameters
+    ----------
+    output_dir : str
+        Output directory where the symlink will be created.
+    output_name : str
+        Base name for the output files.
+    subject_anomalies : tio.Subject
+        The subject after anomaly transforms (used for suffix).
+    label_file : str
+        Path to the original label image file.
+    """
     # Create output directory and symlink to the original label
     os.makedirs(output_dir, exist_ok=True)
     original_file = build_output_path(
@@ -1178,13 +1273,304 @@ def generate_one_subject(
     if not os.path.isfile(original_file):
         os.symlink(label_file, original_file)
 
+def write_subject(out_image: str, info1: Dict[str, Union[List, str]]):
+    """
+    Write the transform history and metadata for a subject to a CSV file.
+
+    Parameters
+    ----------
+    out_image : str
+        Path to the output image file (used to derive CSV path).
+    transforms : dict
+        Dictionary of transforms (not used directly, but included for compatibility).
+    info1 : dict
+        Dictionary of transform history and metadata to write.
+    """
+    # -----------------
+    # Write history CSV
+    # -----------------
+    csv_path = out_image.replace(".nii.gz", ".csv").replace("Sim", "CSV")
+
+    with open(csv_path, "w", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerows(info1.items())
+
+def lab2img_postprocessed(
+    subject_synth: tio.Subject,
+    transforms: Dict[str, tio.Transform],
+    synth_map: Dict[int, int]
+) -> tio.Subject:
+    """
+    Apply label-to-image synthesis and post-processing transforms to generate a synthetic image.
+
+    This function applies the label-to-image transform, then applies intensity transforms if specified.
+
+    Parameters
+    ----------
+    transforms_labelToImage : tio.Transform
+        Transform to convert label maps to synthetic images.
+    subject_synth : tio.Subject
+        Subject after spatial transforms.
+    transforms : dict
+        Dictionary of transforms (may include 'intensity').
+    synth_map : dict
+        Mapping from label values to synthetic tissue classes.
+
+    Returns
+    -------
+    tio.Subject
+        The subject with synthetic image after all transforms.
+    """
+    # -----------------------
+    # Label 2 image transform
+    # -----------------------
+    subject_synth = tio.RemapLabels(synth_map)(subject_synth)
+    subject_img = transforms["label_to_image"](subject_synth)
+    
+    # --------------------
+    # Intensity transforms
+    # --------------------
+    logger.info("%s==>%s Starting %sIntensity%s transforms", GREEN, RESET, BLUE, RESET)
+    
+    
+    if "intensity" in transforms:
+        subject_img = transforms["intensity"](subject_img)
+    logger.info("%sIntensity%s transforms done -> suffix %s%s%s", GREEN, RESET, BLUE, subject_img["suffix"], RESET)
+        
+    return subject_img
+            
+def generation_output_infos(
+    subject_img: tio.Subject,
+    output_dir: str,
+    output_name: str,
+    subject_spatial: tio.Subject,
+    add_subregions: bool,
+    label_name_to_value: Dict[str, int],
+    subject_anomalies: tio.Subject,
+    label_file: str,
+    sujname: str,
+    subject_down: tio.Subject
+):
+    """
+    Save output files and metadata for a generated synthetic subject.
+
+    This function saves label maps, 4D label maps, high-resolution labels, anomaly maps, and metadata CSVs as needed.
+
+    Parameters
+    ----------
+    subject_img : tio.Subject
+        The subject with synthetic image.
+    output_dir : str
+        Output directory for saving files.
+    output_name : str
+        Base name for output files.
+    subject_spatial : tio.Subject
+        Subject after spatial transforms.
+    add_subregions : bool
+        Whether subregion labels were added.
+    label_name_to_value : dict
+        Mapping from region names to label values.
+    subject_anomalies : tio.Subject
+        Subject after anomaly transforms.
+    label_file : str
+        Path to the original label image file.
+    sujname : str
+        Subject name (used for anomaly map naming).
+    subject_down : tio.Subject
+        Subject after downsampling (used for low-resolution label saving).
+    """
+    # ------------------------
+    # Record transform history
+    # ------------------------
+    info1 = record_history(subject_img)
+
+    short_name = "st"
+    # info1.pop("history", None)
+
+    # ---------------
+    # Prepare outputs
+    # ---------------
+
+    out_label = build_output_path(
+        output_dir, output_name, "Lab", subject_img["suffix"], short_name
+    )
+    out_lab4d = build_output_path(
+        output_dir, output_name, "4DLab", subject_img["suffix"], short_name
+    )
+
+    out_labHighRes = build_output_path(
+        output_dir, output_name, "HRLab", subject_img["suffix"], short_name
+    )
+
+    subject_down.label_bin.save(out_label)
+    if "__label_without_lesionLowRes" in subject_down:
+        out_label_nolesLR = build_output_path(
+            output_dir, output_name, "LowResNoLes_lab", subject_img["suffix"], short_name
+        )
+        subject_down.__label_without_lesionLowRes.save(out_label_nolesLR)
+        
+    subject_img.label.save(out_lab4d)
+    
+    subject_spatial["label"].save(out_labHighRes)
+    logger.info("%s==> Save%s label_bin %s%s%s", GREEN, RESET, BLUE, out_label, RESET)
+    logger.info("%s==> Save%s label_4d  %s%s%s", GREEN, RESET, BLUE, out_lab4d, RESET)
+    logger.info("%s==> Save%s label     %s%s%s", GREEN, RESET, BLUE, out_labHighRes, RESET)
+
+    if add_subregions:
+        output_csv_label = build_output_path(
+            output_dir, output_name, "Names", subject_img["suffix"], short_name)
+        output_csv_label = output_csv_label.replace(".nii.gz", ".csv")
+        dff = pd.DataFrame(label_name_to_value.items(), columns=['Name', 'Label'])
+        dff.to_csv(output_csv_label, index=False)
+
+    if "lesion_label_values" in subject_anomalies:
+        ano_path = build_output_path(
+            output_dir, output_name, "Ano", subject_img["suffix"], short_name
+        )
+        subject_anomalies["label"].save(ano_path)
+        logger.info("%s==> Save%s anomalies label %s%s%s", GREEN, RESET, BLUE, ano_path, RESET)
+        add_anomalies_map(sujname, subject_anomalies, output_dir, label_file)
+
+    # Case where we want to save the label without lesion
+    if "__label_without_lesion" in subject_spatial:
+        out_label_noles = build_output_path(
+            output_dir, output_name, "NoLes_lab", subject_img["suffix"], short_name
+        )
+        subject_spatial["__label_without_lesion"].save(out_label_noles)
+        logger.info("%s==> Saved%s label without lesion %s%s%s", GREEN, RESET, BLUE, out_label_noles, RESET)
+
+    out_image = build_output_path(
+        output_dir, output_name, "Sim", subject_img["suffix"], short_name
+    )
+    write_subject(out_image, info1)
+    return out_image
+        
+        
+def generate_one_subject(
+    sujname: str,
+    label_file: str,
+    transforms: Dict[str, tio.Transform],
+    label_name_to_value: Dict[str, int],
+    synth_map: Dict[int, int],
+    target_map: Dict[int, int],
+    preprocessing_target_map: Dict[int, int],
+    output_name: str,
+    output_dir: str = ".",
+    add_subregions: bool = True,
+    directory_path_add_subregions: str = "",
+    add_subregions_lab: List[str] = None,
+    nb_pool: int = 3,
+    pre_pool_after_preproc_dilate: int = 0,
+    nb_out_contrast: int = 1,
+    get_label_only: bool = False,
+    label_name_few_to_label_name_all: Dict[str, str] = None
+) -> tio.Subject:
+    """
+    Generate one synthetic subject (image and labels), apply all transforms, and save outputs to disk.
+
+    This function loads a subject's label image, applies preprocessing, anomaly, spatial, and label-to-image transforms,
+    handles subregion label addition, and saves all relevant outputs (labels, images, metadata, anomaly maps).
+
+    Parameters
+    ----------
+    sujname : str
+        Name of the subject (used for logging and output naming).
+    label_file : str
+        Path to the input label map (.nii.gz).
+    transforms : dict
+        Dictionary of transforms (keys: 'anomalies', 'spatial', 'label_to_image', 'intensity', etc.).
+    label_name_to_value : dict
+        Mapping from anatomical structure names (e.g. 'GM', 'WM') to label values.
+
+    synth_map : Dict[int, int]
+        Mapping from label values to synthetic tissue classes (used for intensity generation).
+
+    target_map : Dict[int, int]
+        Mapping from label values to target label values (used for evaluation).
+    preprocessing_target_map : dict or None
+        Optional preprocessing target map for remapping.
+    output_name : str
+        Base name for the output files (without path).
+
+    output_dir : str, optional
+        Output directory where results are saved, by default=current directory.
+
+    add_subregions : bool, optional
+        Whether to add subregion labels, by default=True.
+
+    directory_path_add_subregions : str, optional
+        Directory path where subregion label files are located, by default="".
+
+    add_subregions_lab : List[str], optional
+        List of subregion labels to add, by default=None.
+
+    nb_pool : int, optional
+        Pooling kernel size for downsampling images and labels, by default=3.
+
+    pre_pool_after_preproc_dilate : int, optional
+        label_img = tio.LabelMap(label_file) 
+        name_map_current, label_img = setup_name_map_current(label_name_to_value, preprocessing_target_map, label_img) 
+        
+    label_name_few_to_label_name_all : Dict[str, str], optional
+        Mapping from short label names to full label names (used for remapping in subregions), by default=None.
+
+    Returns
+    -------
+    tio.Subject
+        The transformed subject with anomalies included, for post-processing or tracking.
+    """
+    full_history = {}
+
+    # ---------------------------
+    # Load and preprocess subject
+    # ---------------------------
+    preprocessed_subject = load_and_preprocess_subject(
+        label_file,
+        transforms,
+        label_name_few_to_label_name_all,
+        pre_pool_after_preproc_dilate,
+        add_subregions,
+        directory_path_add_subregions,
+        add_subregions_lab,
+        label_name_to_value,
+        preprocessing_target_map
+    )
+    
+    full_history["preprocessing"] = {
+        "history": preprocessed_subject.history,
+        "metrics": preprocessed_subject.get("transforms_metrics", [])
+    }
+    
+    # ------------------------------
+    # Anomalies transform (optional)
+    # ------------------------------
+    subject_anomalies, label_name_to_value = anomalies_subject(
+        preprocessed_subject,
+        transforms,
+        label_name_to_value,
+        label_name_few_to_label_name_all
+    )
+    
+    full_history["anomalies"] = {
+        "history": subject_anomalies.history,
+        "metrics": subject_anomalies.get("transforms_metrics", [])
+    }
+
+    # ----------------------
+    # Symlink original label
+    # ----------------------
+    sym_original(output_dir, output_name, subject_anomalies, label_file)
+
     # -----------------
     # Spatial transform
     # -----------------
     logger.info("%s==>%s Starting %sSpatial%s transforms", GREEN, RESET, BLUE, RESET)
-
     subject_spatial = transforms["spatial"](subject_anomalies)
     
+    full_history["spatial"] = {
+        "history": subject_spatial.history,
+        "metrics": subject_spatial.get("transforms_metrics", [])
+    }
 
     # If only label output is requested
     if get_label_only:
@@ -1193,131 +1579,69 @@ def generate_one_subject(
         )
         subject_spatial.label.save(out_label)
         logger.info(
-            "%sSaved label only output%s %s%s%s",
-            YELLOW,
-            YELLOW,
+            "%s==> Save%s label only output %s%s%s",
+            GREEN,
+            RESET,
             BLUE,
             out_label,
             RESET,
         )
-
         return subject_anomalies
 
     logger.info("%s==>%s Starting %sDownsampling%s transforms", GREEN, RESET, BLUE, RESET)
     subject_down = reduce_resolution(target_map, subject_spatial, nb_pool)
+    
+    full_history["downsampling"] = {
+        "history": subject_down.history,
+        "metrics": subject_down.get("transforms_metrics", [])
+    }
+    
+    # -----------------------
+    # Label 2 image transform
+    # -----------------------
+    logger.info(
+        "%s==>%s Starting %sLabel2Image%s transforms contrast %s%s/%s%s", GREEN, RESET, BLUE, RESET, GREEN, 1, nb_out_contrast, RESET
+    )
+
+    # synth_map convertion contrasted_lesion_labels
+    if "contrasted_lesion_labels_to_remove" in subject_down:
+        subject_down["contrasted_lesion_labels_to_remove"] = [synth_map.get(label, label) for label in subject_down["contrasted_lesion_labels_to_remove"]]
+        
+    transforms["label_to_image"] = resolve_transform_anatomies(
+        transforms["label_to_image"], label_name_to_value, label_name_few_to_label_name_all, synth_map
+    )
+    transforms["intensity"] = resolve_transform_anatomies(
+        transforms["intensity"], label_name_to_value, label_name_few_to_label_name_all, synth_map
+    )
 
     for num_contrast in range(1, nb_out_contrast + 1):
-        # -----------------------
-        # Label 2 image transform
-        # -----------------------
-        logger.info(
-            "%s==>%s Starting %sLabel2Image%s transforms contrast %s%s/%s%s", GREEN, RESET, BLUE, RESET, GREEN, num_contrast, nb_out_contrast, RESET
-        )
-
-        transforms_labelToImage = resolve_transform_anatomies(
-            transforms["label_to_image"], label_name_to_value, label_name_few_to_label_name_all, synth_map
-        )
-        subject_img, subject_down, label_bin, label_4d = label_2_image(
-            transforms_labelToImage,
-            target_map,
-            subject_spatial,
-            synth_map,
-            label_name_to_value )
-
-        # --------------------
-        # Intensity transforms
-        # --------------------
-        logger.info("%s==>%s Starting %sIntensity%s transforms", GREEN, RESET, BLUE, RESET)
-        if "intensity" in transforms:
-            subject_img = transforms["intensity"](subject_img)
-
+        subject_img = lab2img_postprocessed(subject_down, transforms, synth_map)
+        full_history["label_to_image_intensity"] = {
+            "history": subject_img.history,
+            "metrics": subject_img.get("transforms_metrics", [])
+        }
+        subject_img.full_history = full_history
+           
         if num_contrast == 1:
-            # ------------------------
-            # Record transform history
-            # ------------------------
-            info1 = record_history(subject_img)
-            #info2 = record_history(subject_down) (
-
-            short_name = "st" #get_transfo_short_name(info1, "order") + get_transfo_short_name(info2, "order")
-            info1.pop("history", None)
-            #info2.pop("history", None)
-
-            # ---------------
-            # Prepare outputs
-            # ---------------
-
-            out_label = build_output_path(
-                output_dir, output_name, "Lab", subject_img["suffix"], short_name
-            )
-            out_lab4d = build_output_path(
-                output_dir, output_name, "4DLab", subject_img["suffix"], short_name
-            )
-            out_image = build_output_path(
-                output_dir, output_name, "Sim", subject_img["suffix"], short_name
-            )
-            out_labHighRes = build_output_path(
-                output_dir, output_name, "HRLab", subject_img["suffix"], short_name
+            out_image = generation_output_infos(
+                subject_img,
+                output_dir,
+                output_name,
+                subject_spatial,
+                add_subregions,
+                label_name_to_value,
+                subject_anomalies,
+                label_file,
+                sujname,
+                subject_down
             )
 
-            subject_down.label_bin.save(out_label)
-            if "__label_without_lesionLowRes" in subject_down:
-                out_label_nolesLR = build_output_path(
-                    output_dir, output_name, "LowResNoLes_lab", subject_img["suffix"], short_name
-                )
-                subject_down.__label_without_lesionLowRes.save(out_label_nolesLR)
-                
-            subject_img.label.save(out_lab4d)
-            
-            subject_spatial["label"].save(out_labHighRes)
-            logger.info("%s==> Save%s label_bin %s%s%s", GREEN, RESET, BLUE, out_label, RESET)
-            logger.info("%s==> Save%s label_4d  %s%s%s", GREEN, RESET, BLUE, out_lab4d, RESET)
-            logger.info("%s==> Save%s label     %s%s%s", GREEN, RESET, BLUE, out_labHighRes, RESET)
-            if add_subregions:
-                output_csv_label = build_output_path(
-                    output_dir, output_name, "Names", subject_img["suffix"], short_name)
-                output_csv_label = output_csv_label.replace(".nii.gz", ".csv")
-                dff = pd.DataFrame(label_name_to_value.items(), columns=['Name', 'Label'])
-                dff.to_csv(output_csv_label, index=False)
+        # Replace "_ContrastN.nii.gz" or ".nii.gz" with the new contrast suffix
+        out_image = re.sub(r'_Contrast\d+\.nii\.gz|\.nii\.gz', f'_Contrast{num_contrast}.nii.gz', out_image)
 
-            if "lesion_label_names" in subject_anomalies:
-                ano_path = build_output_path(
-                    output_dir, output_name, "Ano", subject_img["suffix"], short_name
-                )
-                subject_anomalies["label"].save(ano_path)
-                logger.info("%s==> Save%s anomalies label %s%s%s", YELLOW, RESET, BLUE, ano_path, RESET)
-                add_anomalies_map(sujname, subject_anomalies, output_dir, label_file)
-
-            # Case where we want to save the label without lesion
-            if "__label_without_lesion" in subject_spatial:
-                out_label_noles = build_output_path(
-                    output_dir, output_name, "NoLes_lab", subject_img["suffix"], short_name
-                )
-                # TODO check it
-                subject_spatial["__label_without_lesion"].save(out_label_noles)
-                logger.info("%s==> Saved%s label without lesion %s%s%s", GREEN, RESET, BLUE, out_label_noles, RESET)
-
-            # -----------------
-            # Write history CSV
-            # -----------------
-            csv_path = out_image.replace(".nii.gz", ".csv").replace("Sim", "CSV")
-
-            with open(csv_path, "w", encoding="utf-8") as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerows(info1.items())
-                #writer.writerows(info2.items())
-
-        if nb_out_contrast > 1:
-            # Replace "_ContrastN.nii.gz" or ".nii.gz" with the new contrast suffix
-            out_image = re.sub(r'_Contrast\d+\.nii\.gz|\.nii\.gz', f'_Contrast{num_contrast}.nii.gz', out_image)
-            
         subject_img.synth_mri.save(out_image)
         logger.info("%s==> Save%s synth_mri %s%s%s", GREEN, RESET, BLUE, out_image, RESET)
 
-
-    return subject_anomalies
-
-
-# --- Utils for ano map common file between process---
 def _is_empty_or_missing(path: str) -> bool:
     return (not os.path.exists(path)) or os.path.getsize(path) == 0
 
@@ -1398,7 +1722,7 @@ def _atomic_save_labelmap(tensor: torch.Tensor, affine, final_path: str) -> None
         tensor = tensor.unsqueeze(0)
 
     tio.LabelMap(tensor=tensor, affine=affine).save(tmp_path)
-    print(YELLOW, "XXX saved temporary file", RESET, tmp_path)
+    logger.info("%s==> Save%s temporary file %s%s%s", GREEN, RESET, BLUE, tmp_path, RESET)
 
     # Replace atomic in the file system
     os.replace(tmp_path, final_path)
@@ -1482,7 +1806,7 @@ def add_anomalies_map(
         Subject containing data related to anomaly for the subject.
         Must include:
         - 'label' : a `tio.LabelMap`
-        - 'lesion_label_names' : dict mapping lesion label names to their values
+        - 'lesion_label_values' : list of label values corresponding to lesions/anomalies
         - 'anomaly_type' : str, used in the output filename
 
     output_dir : str
@@ -1508,20 +1832,27 @@ def add_anomalies_map(
     subject_path = op.join(amaps_dir, f"Lab_{subject_name}.nii.gz")
 
     # ---- mask of anomalies ----
+    if subject_anomalies["lesion_label_values"] is None or len(subject_anomalies["lesion_label_values"]) == 0:
+        logger.warning(
+            "No lesion label values found for subject %s. No anomalies will be added.", subject_name
+        )
+        return
+
     mask = torch.isin(
         subject_anomalies["label"].data,
-        torch.tensor(list(subject_anomalies["lesion_label_names"].values())),
+        torch.tensor(subject_anomalies["lesion_label_values"])
     )
 
     # ---- save subjects and ano map ----
     if not op.exists(subject_path):
         tio.LabelMap(label_file).save(subject_path)
-        logger.info("Save subject %s%s%s", YELLOW, subject_path, RESET)
+        logger.info("%s==> Save%s subject %s%s%s", GREEN, RESET, BLUE, subject_path, RESET)
 
     add_mask_safely(subject_anomalies, anomalies_path, mask)
 
     logger.info("Subject anomalies map updated %s%s%s", BLUE, anomalies_path, RESET)
 
+        
 def log_subject_example(subject_idx, subject_number, total_files, example_num, total_examples):
     """
     Log the subject/example progress message in a consistent format.
@@ -1573,6 +1904,10 @@ def main(args: argparse.Namespace):
         label_name_few_to_label_name_all,
         preprocessing_target_map
     ) = get_label_set_config(args.dataset, config.dataset)
+    
+    if args.get_nb_subjects:
+        logger.info("Number of subjects found: %d", len(files))
+        return
 
     # Create temporary output_dir name
     tmp_name = op.basename(tempfile.TemporaryDirectory().name)
@@ -1592,6 +1927,15 @@ def main(args: argparse.Namespace):
                 # Reload config for each subject
                 # to avoid issues with transforms containing random elements that are not re-instantiated at each generation loop
                 config = load_config(args.outputdir, args.dataset, args.anomaly_type, args.config_filename)
+                (
+                    label_set_name,
+                    files,
+                    label_name_to_value,
+                    synth_label_to_tissue,
+                    synth_label_to_target,
+                    label_name_few_to_label_name_all,
+                    preprocessing_target_map
+                ) = get_label_set_config(args.dataset, config.dataset)
 
             sujname = f"{label_set_name}_Suj_{subject_number:02}"
             fout = f"gen{ngen + 1:03}_{sujname}.nii.gz"
@@ -1623,7 +1967,6 @@ def main(args: argparse.Namespace):
                 get_label_only=args.get_label_only,
                 label_name_few_to_label_name_all=label_name_few_to_label_name_all
             )
-
 
 if __name__ == "__main__":
     main(parse_args())

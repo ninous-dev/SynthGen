@@ -3,7 +3,7 @@ from typing import List, Union
 import torchio as tio
 
 from transforms_class.AnomalyLabelTransform import AnomalyLabelTransform
-from utils.logger import BLUE, GREEN, RESET
+from utils.logger import BLUE, GREEN, RESET, configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +21,12 @@ class DeformLabel(AnomalyLabelTransform):
         locked_borders: int = 3,
         background_value: int = 0,
         nb_deforms: Union[int, List[int]] = 1,
+        verbose_dev: bool = True,
         **kwargs
     ):
         suffix = f"DefLab{mode.capitalize()}"
         super().__init__(anomaly_suffix=suffix, **kwargs)
+        configure_logging(dev_mode=verbose_dev, module_name=__name__)
 
         # Initialize attributes
         self.mode = mode
@@ -79,6 +81,8 @@ class DeformLabel(AnomalyLabelTransform):
 
     @AnomalyLabelTransform.update_subject_anomaly_and_log_success
     def apply_transform(self, subject: tio.Subject) -> tio.Subject:
+        logger.info("%s[DeformLabel]%s Started", BLUE, RESET)
+
         self.check_anatomy_resolved()
         
         # Resolve random parameters

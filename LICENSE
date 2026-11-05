@@ -1,12 +1,32 @@
 Copyright (c) 2024 Ines Khemir and Romain Valabregue
 
 Permission is hereby granted, free of charge, to use, copy, modify, and distribute
-this software and its documentation for **research and educational purposes only**,
+this software and its documentation for **research and educational purposes**,
 without fee and without a written agreement, provided that the above copyright
 notice and this paragraph appear in all copies.
 
-Commercial use of this software, in whole or in part, is strictly prohibited
-without prior written permission from the copyright holder.
+================================================================================
+ATTRIBUTION REQUIRED - MANDATORY CITATION
+================================================================================
+
+Any use of this software MUST include proper attribution to the authors:
+- Romain Valabregue <romain.valabregue@upmc.fr>
+- Ines Khemir <ikhemir@hotmail.fr>
+
+Citation of the authors is MANDATORY in any use of this software.
+
+================================================================================
+COMMERCIAL LICENSE
+================================================================================
+
+Commercial use of this software is STRICTLY PROHIBITED without prior written 
+permission from the copyright holders.
+
+To request a commercial license, please contact both authors:
+  Ines Khemir: ikhemir@hotmail.fr
+  Romain Valabregue: romain.valabregue@upmc.fr
+
+================================================================================
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES

@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from scipy.ndimage import binary_dilation
 
 from transforms_class.utils.perlin_utils import generate_perlin_map
+from utils.random import random_probability
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ class AnomalyLabelTransform(LabelTransform):
     """
     def __init__(self, anomaly_suffix: str, nickname: str = None, **kwargs):
         super().__init__(**kwargs)
+
 
         if anomaly_suffix is None:
             raise NotImplementedError(
@@ -84,6 +86,9 @@ class AnomalyLabelTransform(LabelTransform):
         """Convertit un int en tuple (value, value), sinon retourne la valeur inchangée."""
         if isinstance(value, int):
             return (value, value)
+        if isinstance(value, list) and len(value) == 2:
+            if value[0] > value[1]:
+                raise ValueError(f"Invalid range: {value}. The first element must be less than or equal to the second.")
         return value
     
     @staticmethod
@@ -148,20 +153,30 @@ class AnomalyLabelTransform(LabelTransform):
         """
         if isinstance(param, (int, float, str)):
             return param
+        
         if list_choice:
             if isinstance(param, list):
                 return random.choice(param)
             if isinstance(param, (int, float, str)):
                 return param
             raise ValueError(f"Expected int or list for list_choice=True, got {type(param)}")
+
         if isinstance(param, (tuple, list)):
-            if all(isinstance(x, int) for x in param):
-                return random.randint(param[0], param[1])
-            elif all(isinstance(x, float) for x in param):
+            if len(param) != 2:
+                raise ValueError(f"Expected 2 bounds, got: {param}")
+
+            if all(isinstance(x, (int, float)) for x in param):
+                if all(isinstance(x, int) for x in param):
+                    return random.randint(param[0], param[1])
+
+                # If any of the bounds are float, return a float value rounded to 2 decimal places
                 return round(random.uniform(param[0], param[1]), 2)
-        else:
-            raise ValueError("Parameter must be either a list, a tuple, or a single value. Got: {}, which is of type {}".format(param, type(param)))
-        return param
+
+            raise ValueError(
+                f"Tuple or list must contain numeric values. Got: {param}, "
+                f"which contains types: {[type(x) for x in param]}"
+            )
+        raise ValueError("Parameter must be either a list, a tuple, or a single value. Got: {}, which is of type {}".format(param, type(param)))
 
     def update_subject_anomaly(self, subject: tio.Subject) -> None:
         """
@@ -400,7 +415,7 @@ class AnomalyLabelTransform(LabelTransform):
         spline_order: int = 3,
         target_point: Optional[Tuple[int, int, int]] = None,
         keep_dilation: int = 2,
-        perlin_unidirectional_threshold: float = 0.25,
+        perlin_unidirectional_threshold: float = 0.5,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -576,12 +591,14 @@ class AnomalyLabelTransform(LabelTransform):
         # Get contours irregular with perlin noise
         for _ in range(max_growth):
             perlin_map = generate_perlin_map(
-                    lesion_mask.squeeze().shape,
+                    contours.squeeze().shape,
                     scale=scale,
                     octaves=octaves,
                     lacunarity=lacunarity,
                     base=random.randint(0, 100)
                 )
+            # Normalize perlin_map to [0, 1]
+            perlin_map = (perlin_map - perlin_map.min()) / (perlin_map.max() - perlin_map.min() + 1e-8)
             # Perlin on dilation
             dilated = binary_dilation(contours, iterations=dilation)
             # Add to contours where Perlin is above threshold and within dilation of current contours
@@ -626,7 +643,7 @@ class AnomalyLabelTransform(LabelTransform):
             shape: Tuple[int],
             center: Tuple[int],
             radii: Tuple[int],
-            gradient: bool = False
+            p_gradient: float = 0
         ) -> torch.Tensor:
         """
         Generate an elliptical shape based on the provided shape, center, and radii.
@@ -642,6 +659,9 @@ class AnomalyLabelTransform(LabelTransform):
         radii : Tuple[int] 
             The radii of the elliptical mask in each dimension (z, y, x).
         
+        p_gradient : float, optional
+            Probability of applying a gradient to the elliptical mask. If 0, a binary mask is created. If greater than 0, a gradient mask is created with values decreasing from the center to
+        
         Returns
         -------
         torch.Tensor
@@ -654,7 +674,7 @@ class AnomalyLabelTransform(LabelTransform):
                     (vy / radii[1]) ** 2 + \
                     (vz / radii[0]) ** 2
         
-        if gradient:
+        if random_probability(p_gradient):
             elliptical = torch.exp(-norm_dist)
             elliptical = torch.where(elliptical > 0.1, elliptical, 0)
         else:
@@ -850,10 +870,16 @@ class AnomalyLabelTransform(LabelTransform):
             if type(unique_values[0]) != int:
                 raise ValueError(f"background_value must be an integer or a list of integers. Got {type(unique_values[0])} in the list.")
             self.background_value = unique_values[0]
+            logger.info(f"{BLUE}[AnomalyLabelTransform]{RESET} background_value = {BLUE}{self.background_value}{RESET}")
             
-    def add_labels_names(self, subject: tio.Subject, lesion_label_names: dict):
-        if "lesion_label_names" in subject:
-            # Update lesion_label_names if it already exists
-            subject["lesion_label_names"].update(lesion_label_names)
+    def add_labels_names(self, subject: tio.Subject, lesions: list, contrasted_labels: list):
+        if "lesion_label_values" in subject:
+            # Update lesion_label_values list.
+            subject["lesion_label_values"] += lesions
         else:
-            subject["lesion_label_names"] = lesion_label_names
+            subject["lesion_label_values"] = lesions
+
+        if "contrasted_lesion_labels" in subject:
+            subject["contrasted_lesion_labels"] += contrasted_labels
+        else:
+            subject["contrasted_lesion_labels"] = contrasted_labels

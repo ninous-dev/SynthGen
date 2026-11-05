@@ -10,7 +10,7 @@ from transforms_class.utils.lesions_tool_box import (
         get_random_position_in_label
     )
 from transforms_class.utils.perlin_utils import random_perlin_threshold
-from utils.logger import BLUE, GREEN, ORANGE, RESET
+from utils.logger import BLUE, GREEN, YELLOW, RESET, configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +37,6 @@ class MSTransform(AnomalyLabelTransform):
         The size of the sclerosis to add. If None, sclerosis will not be constrained by size.
         If a tuple, it should be (min_size, max_size).
 
-    gradient : bool, optional, default=False
-        Whether to use a gradient for the sclerosis shape.
-
     random_field_mask : str, optional, default=None
         The type of random field mask to use for the sclerosis shape. Can be "bidirectional", "unidirectional", or None.
 
@@ -47,6 +44,10 @@ class MSTransform(AnomalyLabelTransform):
         The probability of using Perlin noise for the contour of the sclerosis shape.
 
     random_sizes : bool, optional, default=True
+        Whether to use random sizes for the generated sclerosis (if False, will use max_size for all).
+    
+    verbose_dev : bool, optional
+        If True, enables verbose logging for development purposes. Default is True.
 
     **kwargs
         Additional keyword arguments for the parent class.
@@ -59,22 +60,23 @@ class MSTransform(AnomalyLabelTransform):
         lesion_label: int,
         background_value: int,
         sclerosis_size: Tuple[int] = None,
-        gradient: bool = False,
         random_field_mask: str = None,
         perlin_contour_proba: float = 0.9,
         random_sizes: bool = True,
+        verbose_dev: bool = True,
         **kwargs
     ):
         suffix = "MS"
         super().__init__(anomaly_suffix=suffix, **kwargs)
+        configure_logging(dev_mode=verbose_dev, module_name=__name__)
 
         self.labels_to_target = AnomalyLabelTransform.int_to_list(labels_to_target)
         self.nb_sclerosis = AnomalyLabelTransform.int_to_tuple(nb_sclerosis)
 
+        self.sclerosis_size = sclerosis_size
         self.sclerosis_min_size, self.sclerosis_max_size = sclerosis_size if sclerosis_size is not None else (None, None)
 
         self.lesion_label = lesion_label
-        self.gradient = gradient
         self.background_value = background_value
         self.random_field_mask = random_field_mask
         self.perlin_contour_proba = perlin_contour_proba
@@ -84,13 +86,17 @@ class MSTransform(AnomalyLabelTransform):
             "labels_to_target",
             "nb_sclerosis",
             "lesion_label",
-            "background_value"
+            "background_value",
+            "sclerosis_size",
+            "random_field_mask",
+            "perlin_contour_proba",
+            "random_sizes",
         ]
 
    
     def create_random_elliptical(
             self,
-            cropped_tensor: Union[torch.Tensor, np.ndarray]
+            cropped_tensor: Union[torch.Tensor, np.ndarray],
         ) -> np.ndarray:
         """
         Create a random elliptical array with the same shape as `cropped_tensor`.
@@ -98,7 +104,7 @@ class MSTransform(AnomalyLabelTransform):
         Parameters
         ----------
         cropped_tensor : torch.Tensor | np.ndarray
-            Input volume; only its shape is used.
+            Input volume; only its shape is used
 
         Returns
         -------
@@ -107,7 +113,7 @@ class MSTransform(AnomalyLabelTransform):
         """
         # Generate elliptical shape
         center, radii = AnomalyLabelTransform.generate_radii_from_shape(cropped_tensor.shape)
-        elliptical = AnomalyLabelTransform.generate_elliptical(cropped_tensor.shape, center, radii, self.gradient)
+        elliptical = AnomalyLabelTransform.generate_elliptical(cropped_tensor.shape, center, radii)
         mask = (elliptical.data > 0)
         try :
             mask = AnomalyLabelTransform.deform_mask(
@@ -117,7 +123,7 @@ class MSTransform(AnomalyLabelTransform):
             ).squeeze(0)
         except ValueError as e:
             if "Deformation resulted in identical image data" in str(e):
-                logger.warning("%s%s%s", ORANGE, e, RESET)
+                logger.warning("%s%s%s", YELLOW, e, RESET)
             else:
                 raise e
 
@@ -126,9 +132,6 @@ class MSTransform(AnomalyLabelTransform):
             mask = self.apply_perlin_contours(mask.bool())
 
         # Add gradient-based shape
-        if self.gradient:
-            return self.add_weighted_noise(mask, noise_level=0.15) + mask.float() * self.lesion_label
-
         return torch.where(
             mask.bool() & torch.isin(cropped_tensor, torch.tensor(self.labels_to_target)),
             self.lesion_label,
@@ -158,7 +161,7 @@ class MSTransform(AnomalyLabelTransform):
         mask_np = mask.cpu().numpy()
 
         # Generate irregular Perlin-based contours
-        perlin_threshold_contour = random_perlin_threshold()
+        perlin_threshold_contour = random_perlin_threshold(end=0.75, step=0.05, start=0.25)
         contours_mask = self.create_irregular_contours_perlin(
             lesion_mask=mask_np,
             max_growth=max_growth,
@@ -171,29 +174,6 @@ class MSTransform(AnomalyLabelTransform):
         # Combine Perlin contour + lesion
         return torch.from_numpy((mask_np | contours_mask).astype(int))
 
-    def add_weighted_noise(self, elliptical_tensor: torch.Tensor, noise_level: float) -> torch.Tensor:
-        """
-        Add random noise weighted by `elliptical_tensor`.
-
-        Parameters
-        ----------
-        elliptical_tensor : torch.Tensor
-            Weight map (same shape as output); higher values → more noise.
-        noise_level : float
-            Global noise amplitude.
-
-        Returns
-        -------
-        torch.Tensor
-            Tensor of same shape as `elliptical_tensor`, with weighted noise added.
-        """
-        noise = torch.randn_like(elliptical_tensor) * noise_level
-        weight = (1 - elliptical_tensor).clamp(min=0.0, max=1.0)
-
-        elipse_noisy = (noise * weight) + elliptical_tensor
-
-        return elipse_noisy.clamp(0.0, 1.0)
-    
     @AnomalyLabelTransform.update_subject_anomaly_and_log_success
     def apply_transform(self, subject: tio.Subject) -> tio.Subject:
         """
@@ -209,13 +189,15 @@ class MSTransform(AnomalyLabelTransform):
         tio.Subject
             The transformed subject (input modified in place and returned).
         """
+        logger.info("%s[MS %s]%s Started", BLUE, self.anomaly_suffix, RESET)
+
         if isinstance(self.lesion_label, list) and len(self.lesion_label) == 1:
             self.lesion_label = self.lesion_label[0]
         if not isinstance(self.lesion_label, int):
             raise ValueError(f"lesion_label must be an integer. Got {type(self.lesion_label)} with value {self.lesion_label}.")
+        
 
-        logger.info(f"{BLUE}[MS]{RESET} Lesion label = {GREEN}{self.lesion_label}{RESET}")
-
+        logger.info("%s[MS %s]%s Lesion label = %s%d%s", BLUE, self.anomaly_suffix, RESET, GREEN, self.lesion_label, RESET)
         nb_sclerosis = random.randint(*self.nb_sclerosis) # nosec B311
         min_size, max_size = float('inf'), 0
         
@@ -230,9 +212,9 @@ class MSTransform(AnomalyLabelTransform):
                     tensor=tio_image.data,
                     affine=tio_image.affine)  
                 subject.add_image(without_lesion_label_image, "__label_without_lesion")
-                logger.info(f"{BLUE}[MS]{RESET} Adding __label_without_lession in subject ")
+                logger.info("%s[MS %s]%s Adding __label_without_lession in subject ", BLUE, self.anomaly_suffix, RESET)
 
-            logger.info(f"{BLUE}[MS]{RESET} Adding {BLUE}{nb_sclerosis}{RESET} sclerosis")
+            logger.info("%s[MS %s]%s Adding %s%d%s sclerosis", BLUE, self.anomaly_suffix, RESET, BLUE, nb_sclerosis, RESET)
             data_tensor = tio_image.data
 
 
@@ -256,7 +238,7 @@ class MSTransform(AnomalyLabelTransform):
                 # Log size of sclerosis (cropped_label_tensor)
                 min_size = min(min_size, min(cropped_label_tensor.shape))
                 max_size = max(max_size, max(cropped_label_tensor.shape))
-                logger.info(f"{BLUE}[MS]{RESET} Sclerosis size: {GREEN}{cropped_label_tensor.shape}{RESET}")
+                logger.info("%s[MS %s]%s Sclerosis %s%s/%s%s size: %s", BLUE, self.anomaly_suffix, RESET, GREEN, nb_cur_sclerosis + 1, nb_sclerosis, RESET, cropped_label_tensor.shape)
 
                 # Generate and insert the lesion
                 elliptical_noisy_deform = self.create_random_elliptical(cropped_label_tensor).squeeze()
@@ -275,7 +257,7 @@ class MSTransform(AnomalyLabelTransform):
         subject["max_size"] = max_size
         subject["nb_sclerosis"] = nb_sclerosis
         
-        self.add_labels_names(subject, {"MS_lesion": self.lesion_label})
+        self.add_labels_names(subject, [self.lesion_label], contrasted_labels=[self.lesion_label])
         
         
         return subject

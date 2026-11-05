@@ -1,4 +1,5 @@
 import logging
+import sys
 
 RED = "\033[91m"
 BLUE = "\033[94m"
@@ -28,7 +29,7 @@ def configure_logging(dev_mode: bool = False, module_name: str = "transforms_cla
     
     # Optional: add a handler if none exists
     if not logger.handlers:
-        handler = logging.StreamHandler()
+        handler = logging.StreamHandler(stream=sys.stdout)  # stdout instead of stderr (because of logging package behavior)
         formatter = logging.Formatter(
             '%(asctime)s %(message)s'
         )

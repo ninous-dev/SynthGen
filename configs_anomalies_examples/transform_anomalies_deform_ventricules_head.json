@@ -1,0 +1,76 @@
+{
+    "train_transforms": 
+    [
+
+	// Ventricules 
+    {
+        "name": "OneOf",
+        "attributes":    {	"p": 1    },
+        "transforms" : 
+        [
+            {
+                "name": "DeformLabel",
+		"prob": 2, // proba will be normalized with other prob in the list
+                "attributes":
+                {
+                    "p": 1,
+                    "random_field_mask": ["unidirectional", "perlin_unidirectional"],
+                    "displacement": [1],
+                    "grid_space": [10, 20, 40],
+                    "mode": "push",
+                    "labels_to_target" : ["Ventricles"],
+                    "labels_to_keep": ["background", "Skull", "Head"], //, "Dura"
+                    "keep_dilation": 0,
+                    "locked_borders": 2,
+                    "background_value": -1, //"background",
+                    "nb_deforms" : [1],
+                    "perlin_unidirectional_threshold": [0.1, 0.25, 0.5]
+                }
+            },
+            {
+                "name": "DeformLabel",
+		"prob": 1,
+                "attributes":
+                {
+                    "p": 1,
+                    "random_field_mask": ["unidirectional"],
+                    "displacement": [1],
+                    "grid_space": [10, 20, 40],
+                    "mode": "pull",
+                    "labels_to_target" : ["Ventricles"],
+                    "labels_to_keep": ["background", "Skull", "Head"], //, "Dura"
+                    "keep_dilation": 0,
+                    "locked_borders": 2,
+                    "background_value": -1,// "background",
+                    "nb_deforms" : [1]
+                }
+            }
+        ]
+    },
+
+    // Head
+    {
+    "name": "HeadTransform",
+        "attributes":
+        {
+            "p": 1,
+            "displacement": [0.5], 
+            "grid_space": [2, 5], //if 1 too smal, and errors
+            "mode": "pull",
+            "locked_borders": 2,
+            "background_value": -1, // "background", do not work any more !!!
+	    "labels_to_target" : ["background"],
+            "labels_to_keep": [  "CSF", "Striatum", "Thal", "Ventricles", "WM" ],
+            "random_field_mask": [null, "perlin_unidirectional"],
+            "nb_deforms" : [1, 2, 4],
+            // "center_labels": ["Striatum", "Thal"]
+        }
+    }
+    ],
+    "val_transforms": []
+}
+
+
+
+
+

@@ -2,6 +2,7 @@ import concurrent.futures
 import logging
 import os
 from typing import List, Optional, Tuple, Union
+import uuid
 import numpy as np
 import SimpleITK as sitk
 import torch
@@ -91,7 +92,7 @@ class DeformationTransform(LabelTransform):
         random_field_mask: Optional[str] = None,
         target_point: Tuple[int] = None,
         keep_dilation: int = 2,
-        perlin_unidirectional_threshold: float = 0.25,
+        perlin_unidirectional_threshold: float = 0.5,
         attention_mask: Optional[tio.LabelMap] = None,
         **kwargs,
     ):
@@ -959,12 +960,14 @@ class DeformationTransform(LabelTransform):
             control_points = self.generate_control_points_grid(
                 sitk_image
             )
-
+            
             # Apply B-spline deformation
             deformed = self.apply_bspline_deformation(
                 sitk_image,
                 control_points,
             )
+
+            # save image and deformation control points in deformation_examples new name each time using torchio
             if torch.equal(deformed.data, image.data):
                 raise ValueError("Deformation resulted in identical image data. Check parameters and input image. Consider adjusting grid_space, displacement, or label configuration.")
 

@@ -6,7 +6,7 @@ import torchio as tio
 # Internal imports
 from transforms_class.AnomalyLabelTransform import AnomalyLabelTransform
 
-from utils.logger import BLUE, GREEN, RESET
+from utils.logger import BLUE, GREEN, RESET, configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,18 @@ class PeriventricularMS(AnomalyLabelTransform):
 
     perlin_lacunarity : Union[float, Tuple[float, float]], optional, default=2.0
         Lacunarity for Perlin noise, controls frequency multiplier between octaves. If a tuple, a random value is chosen in the range.
+
+    random_field_mask : str, optional, default="bidirectional"
+        Type of random field mask to use for deformation.
+    
+    perlin_unidirectional_threshold_deform : float, optional, default=0.25
+        Threshold for unidirectional Perlin noise used in deformation, controls directionality of deformation.
+    
+    perlin_threshold_deform : float, optional, default=0.25
+        Threshold for applying deformation based on Perlin noise, controls how much of the mask is deformed.
+
+    verbose_dev : bool, optional
+        If True, enables verbose logging for development purposes. Default is True.
     """    
     def __init__(
         self,
@@ -56,11 +68,14 @@ class PeriventricularMS(AnomalyLabelTransform):
         perlin_threshold: Union[float, Tuple[float, float]] = 0.5,
         perlin_lacunarity: Union[float, Tuple[float, float]] = 2.0,
         random_field_mask="bidirectional",
-        perlin_threshold_deform: float = 0.25,
+        perlin_threshold_deform: float = 0.5,
+        verbose_dev: bool = True,
         **kwargs
     ):
         suffix = "PeriVent"
         super().__init__(anomaly_suffix=suffix, **kwargs)
+        configure_logging(dev_mode=verbose_dev, module_name=__name__)
+
         
         self.ventricular_label = ventricular_label
         self.labels_to_target = labels_to_target
@@ -80,7 +95,14 @@ class PeriventricularMS(AnomalyLabelTransform):
         self.args_names = [
             'ventricular_label',
             'grid_space', 
-            'labels_to_target'
+            'labels_to_target',
+            'perlin_scale',
+            'perlin_octaves',
+            'perlin_threshold',
+            'perlin_lacunarity',
+            'displacement',
+            'random_field_mask',
+            'perlin_threshold_deform',
         ]
     
     @staticmethod
@@ -168,6 +190,8 @@ class PeriventricularMS(AnomalyLabelTransform):
         tio.Subject
             The transformed subject with synthetic periventricular MS lesions.
         """
+        logger.info("%s[PeriventricularMS]%s Started", BLUE, RESET)
+
         # Validate labels and resolve random parameters before processing
         self.__validate_labels()
         self.__resolve_random_parameters()
@@ -249,13 +273,6 @@ class PeriventricularMS(AnomalyLabelTransform):
             # Apply lesion
             img.set_data(result)
             
-        subject["grid_space"] = self.grid_space
-        subject["displacement"] = self.displacement
-        subject["perlin_threshold"] = self.perlin_threshold
-        subject["perlin_scale"] = self.perlin_scale
-        subject["perlin_octaves"] = self.perlin_octaves
-        subject["perlin_lacunarity"] = self.perlin_lacunarity
-        subject["random_field_mask"] = self.random_field_mask
-        subject["perlin_threshold_deform"] = self.perlin_threshold_deform
-
+        self.add_labels_names(subject, [self.lesion_label], contrasted_labels=[self.lesion_label])
+            
         return subject

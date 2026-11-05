@@ -6,7 +6,7 @@ import random
 from scipy.ndimage import center_of_mass
 
 from transforms_class.AnomalyLabelTransform import AnomalyLabelTransform
-from utils.logger import BLUE, GREEN, RED, RESET, YELLOW
+from utils.logger import BLUE, GREEN, RED, RESET, YELLOW, configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +23,12 @@ class DeformCSFTransform(AnomalyLabelTransform):
         perlin_unidirectional_threshold: Union[float, List[float]] = 0.25,
         retry_while_deform_same: int = 1,
         random_field_mask: Union[str, List[str]] = "perlin_unidirectional_thresholded",
+        verbose_dev: bool = True,
         **kwargs
     ):
         suffix = f"DeformCSF{mode.capitalize()}"
         super().__init__(anomaly_suffix=suffix, **kwargs)
+        configure_logging(dev_mode=verbose_dev, module_name=__name__)
 
         # Initialize attributes
         self.mode = mode
@@ -80,24 +82,29 @@ class DeformCSFTransform(AnomalyLabelTransform):
     
         # log each parameter value
         for param_name, param_value in random_params.items():
-            logger.info(f"{BLUE}[DEFORMLABEL]{RESET} {param_name} = {BLUE}{param_value}{RESET}")
+            logger.info(f"{BLUE}[DeformCSFTransform]{RESET} {param_name} = {BLUE}{param_value}{RESET}")
     
     @AnomalyLabelTransform.update_subject_anomaly_and_log_success
     def apply_transform(self, subject: tio.Subject) -> tio.Subject:
+        logger.info("%s[DeformCSFTransform]%s Started", BLUE, RESET)
+
         self.check_anatomy_resolved()
         self.check_unique_background_value()
         self.resolve_random_parameters()
         
         for _, label_image in self.get_images_dict(subject).items():
-            
-            keep_mask = torch.isin(
-                    label_image.data.squeeze(0),
-                    torch.tensor(self.labels_to_keep)
-            ).unsqueeze(0)
-            label_image_data_without_keep = torch.where(
-                keep_mask,
-            self.background_value, 
-            label_image.data)
+
+            if self.labels_to_keep is not None:
+                keep_mask = torch.isin(
+                        label_image.data.squeeze(0),
+                        torch.tensor(self.labels_to_keep)
+                ).unsqueeze(0)
+                label_image_data_without_keep = torch.where(
+                    keep_mask,
+                self.background_value, 
+                label_image.data)
+            else:
+                label_image_data_without_keep = label_image.data.clone()
 
             logger.info(f"{BLUE}[DeformCSFTransform]{RESET} displacement = {BLUE}{self.displacement}{RESET}")
             logger.info(f"{BLUE}[DeformCSFTransform]{RESET} grid_space = {BLUE}{self.grid_space}{RESET}")
@@ -137,12 +144,19 @@ class DeformCSFTransform(AnomalyLabelTransform):
                     else:
                         logger.error(f"{RED}Unexpected error during deformation: {e}{RESET}")
                         raise e
-            
-            label_image_keep_only = torch.where(torch.isin(label_image.data.squeeze(0), torch.tensor(self.labels_to_keep)).unsqueeze(0), label_image.data, -1)
-            
+
+            if self.labels_to_keep is not None:
+                label_image_keep_only = torch.where(torch.isin(label_image.data.squeeze(0), torch.tensor(self.labels_to_keep)).unsqueeze(0), label_image.data, -1)
+            else:
+                label_image_keep_only = torch.full_like(label_image.data, -1)  # Create a tensor filled with -1
+
             # Put back the labels to keep in the deformed image
             label_image_data = torch.where(label_image_keep_only != -1, label_image_keep_only, label_image_data)
-            
+
+            # controle that label_image_data is differente from label_image.data
+            if torch.equal(label_image_data, label_image.data):
+                logger.warning(f"{YELLOW}Deformation resulted in identical image data after reinserting labels to keep. This may indicate an issue with the deformation process.{RESET}")
+                raise ValueError("Deformation resulted in identical image data after reinserting labels to keep. This may indicate an issue with the deformation process.")
             label_image.set_data(label_image_data)
 
         return subject

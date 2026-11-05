@@ -1,201 +1,208 @@
-TODO refaire presque enierement
-# Synthetic MRI Generator: Code & Pipeline Overview
 
-This repository provides a modular pipeline for generating synthetic MRI images and labels from anatomical label maps, with support for random morphology edits, spatial and intensity transforms, anomaly simulation, and flexible dataset configuration.
+# Synthetic Brain MRI Generator
 
----
+Synthetic brain MRI generator with anatomical labels and controlled anomalies
 
-## Code Structure & Main Logic
+## Table of Contents
+- [Overview](#overview)
+- [Latest Article](#latest-article)
+- [Data](#data)
+- [Installation](#installation)
+- [Repository Structure](#repository-structure)
+- [Main Commands](#command-line-arguments)
+- [Additional Documentation](#additional-documentation)
+- [Configuration: configs.ini](#configuration-configsini)
+- [Contributing](#contributing)
+- [License](#license)
+- [Contact](#contact)
 
-### Main script: `generate.py`
-- **Entry point** for the synthetic data generation pipeline.
-- Loads configuration files (INI and JSON), parses dataset and transform parameters.
-- Iterates over subjects and generates synthetic images/labels using a sequence of transforms.
-- Records all steps, parameters, and random seeds in a CSV log for reproducibility.
+## Overview
 
-### Key modules:
-- `generate.py`: Orchestrates the full pipeline, argument parsing, config loading, and output management.
-- `transforms_class/`: Custom TorchIO-compatible transforms for domain-specific deformations (e.g., MS, tumor, CSF, etc).
-- `utils/`: Utility functions for file I/O, logging, and job management.
-- `analyse/`: Scripts for post-generation analysis and metrics.
-- `check_datasets/`: Scripts for dataset validation and label checking.
+This project generates synthetic brain MRI images from anatomical label maps, with advanced anomaly management (lesions, tumors, etc.) and configurable pipelines via TorchIO.
 
-### Pipeline Steps (per subject):
-1. **Load label map** (`.nii.gz`).
-2. **Preprocessing** (optional): e.g., erosion, subregion addition, label remapping.
-3. **Morphological edits**: Random dilations or boundary tweaks (CSF, GM, WM).
-4. **Spatial transforms**: Affine, elastic, or custom deformations (configurable via JSON).
-5. **Anomaly simulation**: Optional, via anomaly-specific transform configs (e.g., MS, tumor, ventricles).
-6. **Label remapping**: To target and synthetic label sets (for ground truth and image synthesis).
-7. **Label-to-image synthesis**: Generates intensity images from label maps (configurable via JSON).
-8. **Intensity transforms**: Bias field, noise, motion, rescaling, etc.
-9. **Pooling/downsampling**: Ensures output shapes are compatible and realistic.
-10. **Save outputs**: NIfTI images (`Sim*.nii.gz`, `Lab*.nii.gz`, `4DLab*.nii.gz`), CSV logs, and anomaly maps.
+Main features:
 
-All steps are modular and controlled by configuration files.
+- Spatial transformations (rotations, elastic deformations, etc.)
+- Label preprocessing and subregion mapping
+- Anomaly generation (lesions, tumors, etc.)
+- Intensity-based image synthesis
+- Multi-contrast MRI generation
+- Parallel processing with file locking
+- Full transformation history tracking
 
----
+## Latest Article
 
-## Configuration System
+For details and recent results, see the latest article:
 
-The pipeline is controlled by a main INI file and several JSON files:
+**SIAM: Head and Brain MRI Segmentation from Few High-Quality Templates via Synthetic Training** — *Romain Valabregue, Ines Khemir, Eric Badinet, François Rousseau, Guillaume Auzias, Reuben Dorent* ([arXiv:2605.02737](https://arxiv.org/abs/2605.02737))
 
-- **INI config**: Specifies datasets, label CSVs, subject directories, and which transform JSONs to use.
-- **Transform JSONs**: Define the sequence and parameters for spatial, label-to-image, and intensity transforms.
-- **Anomaly JSONs**: Define anomaly-specific transforms (e.g., MS, tumor, ventricles).
+## Data
 
-See `siam_config/v4.2/configs/` for real examples.
+The label templates used by this project are available on Zenodo
 
----
-
-## Example Directory Layout
+### Download and extract
 
 ```bash
-synthetic-mri-generator/
-├── generate.py
-├── requirements.txt
-├── transforms_class/
-├── utils/
-├── analyse/
-├── check_datasets/
-├── ...
-├── configs/
-│   ├── configs.ini
-│   ├── transform_spatial.json
-│   ├── transform_lab2img.json
-│   ├── transform_intensity.json
-│   └── anomalies/
-│       ├── transform_anomalies_deform_csf_ms.json
-│       ├── transform_anomalies_deform_ventricules_head.json
-│       └── transform_anomalies_tumor.json
+wget -O siam_label_template_v1.tar.gz "https://zenodo.org/records/20428684/files/siam_label_template.tar.gz?download=1"
+mkdir -p data
+tar -xzf siam_label_template_v1.tar.gz -C data
 ```
+## Installation
 
----
-
-## How to Use the Pipeline
-
-### 1. Prepare configuration files
-Each `[label_set.datasetX]` section defines a dataset. Example config files are shown for reference; you must create or adapt your own configs locally.
-- Each transform JSON defines a pipeline step (spatial, label-to-image, intensity, anomaly).
-
-### 2. Run the generator
-
+### 1. Clone the repository
 ```bash
-python generate.py \
-  --dataset 1 \
-  --nb_gen 2 \
-  --outputdir /path/to/configs \
-  --config_filename configs.ini \
-  --subject_idx 1
+git clone https://github.com/ninous-dev/SynthGen.git
+cd SynthGen
 ```
 
-#### Main arguments
-- `--dataset, -d`: Dataset section number (matches `[label_set.datasetX]` in INI).
-- `--nb_gen, -n`: Number of synthetic examples per subject.
-- `--outputdir, -o`: Directory containing configs and where outputs will be written.
-- `--config_filename, -c`: Config file name (default=`configs.ini`).
-- `--subject_idx, -s`: (Optional) Only generate for a specific subject index.
+### 2. Create and activate a conda environment
+```bash
+conda create -n synth_gen python=3.10
+conda activate synth_gen
+```
 
-### 3. Outputs
-- Synthetic images, labels, and logs are saved in the output directory, organized by dataset and anomaly.
-- Anomaly maps are accumulated and saved per subject/anomaly type.
+### 3. Install PyTorch
+Follow instructions at [pytorch.org](https://pytorch.org/get-started/locally/) for your CUDA version, e.g.:
+```bash
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+```
 
----
+### 4. Install dependencies
+```bash
+pip install -r requirements.txt
+```
 
-## Configuration File Details
+### 5. Install dependencies for the test suite
+```bash
+pip install pytest pytest-cov
+```
 
-### INI Example
+### 6. Install git hooks
+The pre-commit hook automatically runs the full test suite **with coverage** before each commit.
+Run this **once** after cloning:
+```bash
+bash install_hooks.sh
+```
+> To bypass it exceptionally: `git commit --no-verify`
+
+## Repository Structure
+
+| Folder/File | Description |
+|-----------------|-------------|
+| `generate.py` | Main generation script |
+| `transforms_class/` | Custom TorchIO transforms |
+| `utils/` | Utility functions |
+| `analyse/` | Post-generation analysis scripts |
+| `check_datasets/` | Dataset validation and checking |
+| `configs_anomalies_examples/` | Example anomaly transform JSON files (MS, Tumor, Ventricles) |
+| `jobs_run_cluster/`, `generate.sh`, `batch_generate.sh` | Batch/SLURM execution scripts |
+| `requirements.txt` | Python dependencies |
+| `README_cluster_ICM` | ICM makefile launch process |
+
+## Command Line Arguments
+Argument	Short	Default	Description of the [GENERATION](generate.py)
+
+| Argument           | Short | Default      | Description                          |
+|--------------------|-------|-------------|--------------------------------------|
+| --dataset          | -d    | 1           | Dataset ID from config               |
+| --nb_gen           | -n    | 1           | Images per subject                   |
+| --outputdir        | -o    | .           | Output directory                     |
+| --config_filename  | -c    | configs.ini | Config file name                     |
+| --subject_idx      | -s    | None        | Process specific subject (1-based index) |
+| --nb_contrast      | -z    | 1           | Output contrasts per subject         |
+| --anomaly_type     | -a    | None        | Anomaly type ID                      |
+| --get_label_only   | -     | False       | Generate labels only (no images)     |
+
+## Configuration: `configs.ini`
+
+The `configs.ini` file defines all paths and parameters for the generation pipeline. It is structured in three types of sections:
+
+### `[transforms]`
+
+Paths to the JSON transform files applied to all datasets:
+
 ```ini
 [transforms]
-spatial = transform_spatial.json
-label_to_image = transform_lab2img.json
-intensity = transform_intensity.json
+spatial     = /path/to/transform_spatial.json
+label_to_image = /path/to/transform_lab2img.json
+intensity   = /path/to/transform_intensity.json
+```
 
+### `[anomalies]`
+
+Optional. Maps anomaly IDs (used with `-a`) to their transform JSON files:
+
+```ini
 [anomalies]
-1 = anomalies/transform_anomalies_deform_csf_ms.json
-2 = anomalies/transform_anomalies_deform_ventricules_head.json
-3 = anomalies/transform_anomalies_tumor.json
+1 = /path/to/transform_deform_all_AnoTumor.json
+2 = /path/to/transform_deform_all_AnoMS.json
+```
 
+Example files are available in [`configs_anomalies_examples/`](configs_anomalies_examples/).
+
+### `[label_set.datasetN]`
+
+One section per dataset (indexed from 1). Used with `-d N`.
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `label_set_name` | yes | Short name for the dataset |
+| `subject_dir` | yes | Directory containing the label files |
+| `labels_csv` | yes | CSV file mapping label names to values |
+| `preprocessing` | yes | Path to the preprocessing transform JSON |
+| `synth_col` | yes | Column name in CSV for synthesis mapping |
+| `do_erode` | yes | Whether to apply erosion (`True`/`False`) |
+| `add_subregions` | no | Add subregion labels (`True`/`False`) |
+| `directory_path_add_subregions` | no | Directory with subregion label files |
+| `add_subregions_lab` | no | List of subregion label patterns (regex supported) |
+| `nb_pool` | no | Pooling factor (default: 3) |
+| `pre_pool_after_preproc_dilate` | no | Set to `2` for BigBrain-type datasets |
+
+Example:
+
+```ini
 [label_set.dataset1]
 label_set_name = mida
-subject_dir = /path/to/mida
-labels_csv = /path/to/mida_labels.csv
-preprocessing = /path/to/transform_preprocessing_mida.json
-do_erode = True
-file_regex = ^csf_veine_r025s05
-synth_col = synth
+subject_dir    = /path/to/mida
+labels_csv     = /path/to/mida_labels.csv
+preprocessing  = /path/to/transform_preprocessing_mida.json
+do_erode       = True
+synth_col      = synth
+file_regex     = ^csf_veine_r025s05
 ```
 
-### Label CSV Example
-Each dataset expects a specific CSV structure. For example, MIDA:
+## TestSuite
 
-```csv
-Name,Name_original,synth,synth_tissue_29,synth_targetRegionFew,NameTargetRegionFew,Stratified_Tissue_Region
-Background,Background,50,0,0,background,background
-Dura,Dura,1,13,13,Dura,Dura
-GM,Brain Gray Matter,10,1,1,GM,GM
-WM,Brain White Matter,12,2,2,WM,WM
-...etc
+The test suite covers all transforms in `transforms_class/` and utilities in `transforms_class/utils/`.
+
+### Run tests
+
+```bash
+python -m pytest
 ```
 
----
+This automatically runs with coverage (configured in `pytest.ini`):
+- **Terminal report**: lines not covered are shown inline
+- **HTML report**: generated in `coverage_html/index.html`
 
-## Transform Pipeline Examples
+### Pre-commit hook
 
-### Spatial Transform JSON
-```json
-{
-  "train_transforms": [
-    { "name": "RandomAffine", "attributes": { "p": 0.95, "degrees": 20, "scales": 0.3, "translation": 10 } },
-    { "name": "RandomElasticDeformation", "attributes": { "p": 0.75, "num_control_points": 18, "max_displacement": 6 } }
-  ]
-}
+The hook runs the full suite before every `git commit` and blocks the commit if any test fails.  
+Install once with:
+```bash
+bash install_hooks.sh
 ```
+> To bypass exceptionally: `git commit --no-verify`
 
-### Label-to-Image Transform JSON
-```json
-{
-  "train_transforms": [
-    { "name": "RandomLabelsToImageOneConstraint", "attributes": { "label_key": "label", "image_key": "synth_mri", "default_mean": [0, 1], "default_std": [0.005, 0.05], "minimal_contrasted": 0.1 } }
-  ]
-}
-```
+## Contributing
 
-### Intensity Transform JSON
-```json
-{
-  "train_transforms": [
-    { "name": "RandomBiasField", "attributes": { "p": 1, "coefficients": 0.5, "order": 3 } },
-    { "name": "RandomMotionFromTimeCourse", "attributes": { "p": 0.5, ... } },
-    { "name": "RandomNoise", "attributes": { "mean": 0, "std": [0.01, 0.1] } },
-    { "name": "RescaleIntensity", "attributes": { "out_min_max": [0, 1], "percentiles": [1, 99] } }
-  ]
-}
-```
+Contributions are welcome! For suggestions, bug reports, or feature requests, please open an issue or pull request.
 
-### Anomaly Transform JSON
-See the `anomalies/` folder for detailed configs for each anomaly type (MS, tumor, ventricles, etc).
+## License
 
----
-
-## Advanced Features
-
-- **Anomaly simulation**: Add MS, tumor, or ventricle deformations using anomaly configs.
-- **Flexible label mapping**: Each dataset can define its own label CSV and mapping logic.
-- **Custom transforms**: Extend with your own transforms in `transforms_class/`.
-- **Job batching**: Use the provided shell scripts to generate and submit SLURM jobs for large-scale data generation.
-
----
-
-## Troubleshooting & Tips
-
-- Check logs and CSV outputs for full provenance of each generated subject.
-- Ensure your label CSV matches the expected columns for your dataset.
-- For reproducibility, set random seeds at the start of your script.
-- For performance, run on fast storage and batch jobs using the provided scripts.
-
----
+This project is licensed under [LICENSE](LICENSE).
 
 ## Contact
 
-Dev: Ines Khemir <ikhemir@hotmail.fr>, Romain Valabregue <gitlab@mg.gitlab.com>
+Ines Khemir <ikhemir@hotmail.fr>
+Romain Valabregue <romain.valabregue@upmc.fr>

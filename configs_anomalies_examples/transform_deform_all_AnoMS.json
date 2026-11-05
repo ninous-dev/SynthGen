@@ -1,0 +1,209 @@
+{
+    "train_transforms": 
+    [
+	//Head
+	{
+	    "name": "DeformLabel",
+            "attributes":
+            {
+		"p": 0.95,
+		"displacement": [0.5,1,2], 
+		"grid_space": [5,6,8,12,20,40,60], //[2, 5], //if 1 too smal, and errors
+		"mode": "push",
+		"locked_borders": 0,
+		"background_value": 0, 
+		"labels_to_target" : ["background", "Skull", "Head", "Dura"], //, "Vessels"
+		// "labels_to_keep": [ "Striatum", "Thal", "Ventricles", "WM"], //  "CSF",
+		"random_field_mask": [null, null, "perlin_unidirectional"], // [null], // 
+		"perlin_unidirectional_threshold": [0.1, 0.2, 0.25], // 0.75 -> no displacement 
+		// "nb_deforms" : [1], //, 2, 4],
+		// "center_labels": ["Striatum", "Thal"],
+		"keep_dilation" : 0,
+		"nickname": "Dpush_BGHead"
+            }
+	},
+	
+	// Ventricules // TODO make mode be a random list choice to avoid the oneof here
+	{
+            "name": "OneOf",
+            "attributes":    {	"p": 0.95    },
+            "transforms" : 
+            [
+		{
+                    "name": "DeformLabel",
+		    "prob": 2, // proba will be normalized with other prob in the list
+                    "attributes":
+                    {
+			"p": 1,
+			"random_field_mask": [null,"unidirectional", "perlin_unidirectional"],
+			//"random_field_mask": ["unidirectional"],
+			"displacement": [1],
+			"grid_space": [5, 10, 20, 40],
+			"mode": "push", 
+			"labels_to_target" : ["Ventricles"],
+			"labels_to_keep": ["background", "Skull", "Head"], //, "Dura"
+			"keep_dilation": 0,
+			"locked_borders": 2,
+			"background_value": -1, //"background",
+			"nb_deforms" : [1],
+			"perlin_unidirectional_threshold": [0.1, 0.25, 0.5],
+			"nickname": "Dpush_Vent"
+                    }
+		},
+		{
+                    "name": "DeformLabel",
+		    "prob": 1,
+		    "attributes":
+                    {
+			"p": 1,
+			"random_field_mask": [null,"unidirectional", "perlin_unidirectional"],
+			//"random_field_mask": ["unidirectional"],
+			"displacement": [1],
+			"grid_space": [5, 10, 20, 40],
+			"mode": "pull", 
+			"labels_to_target" : ["Ventricles"],
+			"labels_to_keep": ["background", "Skull", "Head"], //, "Dura"
+			"keep_dilation": 0,
+			"locked_borders": 2,
+			"background_value": -1, //"background",
+			"nb_deforms" : [1],
+			"perlin_unidirectional_threshold": [0.1, 0.25, 0.5],
+			"nickname": "Dpush_Vent"
+                    }
+		}
+            ]
+	},
+
+        //Deform CSF
+        // CEREBELLUM DEFORMATION
+        
+        {
+            "name": "DeformCSFTransform",
+            "attributes":
+            {
+                "p": 0.9,
+                "mode": "pull",
+		//"random_field_mask": ["unidirectional", "perlin_unidirectional"],
+		//"random_field_mask": ["unidirectional"],
+                "background_value": "CSF",
+                "retry_while_deform_same": 2, 
+                "labels_to_target": ["Cereb", "WMCereb"],
+                //"labels_to_keep": ["background", "Skull", "Head", "Dura", "Striatum", "GM", "WM", "Ventricles"], //, "CSF" no csf  , "Vessels"
+                "labels_to_keep": ["background", "Skull", "Head", "Dura"], //, "CSF" no csf  , "Vessels"
+		"perlin_unidirectional_threshold": [0.1, 0.2, 0.25], // 0.5 get empty deform
+                "displacement": [1, 1, 1, 1, 1, 2, 2, 2, 2,  5], //5 not too big
+                "grid_space": [4, 6, 12, 10, 20, 30],
+		"nickname": "DCSF_Cereb"
+            }
+        },
+
+        // CORTEX DEFORMATION
+        {
+            "name": "DeformCSFTransform",
+            "attributes":
+            {
+                "p": 0.9,
+                "mode": "pull",
+		//"random_field_mask": ["unidirectional", "perlin_unidirectional"],
+		//"random_field_mask": ["unidirectional"],
+                "background_value": "CSF",
+                "retry_while_deform_same": 2, 
+                "labels_to_target": [ "GM"], //"WM",
+                //"labels_to_keep": ["background", "Cereb", "WMCereb", "Skull", "Head", "Dura", "Striatum", "Thal", "Ventricles"],  // "Vessels"
+                "labels_to_keep": ["background", "Cereb", "Skull", "Head", "Dura"],  // "Vessels"
+		"perlin_unidirectional_threshold": [0.1, 0.2, 0.25], // 0.5 get empty deform
+		"displacement": [1, 1, 1, 1, 1, 2, 2, 2, 2,  5], //5 not too big
+                "grid_space": [6, 10, 12, 20, 30],
+		"nickname": "DCSF_gm"
+            }
+        },
+	
+
+	// MS 
+        { //WM + Periventricular WM
+	    
+            "name": "PeriventricularMS",
+            "attributes":
+            {
+                "p": 1,
+                "ventricular_label": "Ventricles", 
+                "labels_to_target": ["WM"],
+                "lesion_label": "Lesion",
+                "perlin_threshold": [0.1, 0.95],
+                "displacement": [1, 2, 4],
+                "grid_space": [10, 20, 30, 50]
+            }
+        },
+	{//WM MS two size
+            "name": "OneOf",
+            "attributes":    {	"p": 1    },
+            "transforms" : 
+            [
+		{
+		    "name": "MSTransform",
+		    "prob": 2, 
+		    "attributes":
+		    {
+			"p": 1,
+			"nb_sclerosis": [50, 200], 
+			"lesion_label": "Lesion",
+			"sclerosis_size": [8, 400],
+			"background_value": 0,
+			"random_field_mask": "bidirectional",
+			"labels_to_target" : ["WM"]
+		    }
+		},
+		{
+		    "name": "MSTransform",
+		    "prob": 1, 
+		    "attributes":
+		    {
+			"p": 1,
+			"nb_sclerosis": [150, 350], 
+			"lesion_label": "Lesion",
+			"sclerosis_size": [8, 50],
+			"background_value": 0,
+			"random_field_mask": "bidirectional",
+			"labels_to_target" : ["WM"]
+		    }
+		},
+	    ]
+        },
+        { //GM
+            "name": "MSTransform",
+            "attributes":
+            {
+                "p": 1,
+                "nb_sclerosis": [100, 500], 
+                "lesion_label": "Lesion",
+                "sclerosis_size": [8, 80],
+                "background_value": 0,
+                "random_field_mask": "bidirectional",
+                "labels_to_target" : ["GM"] //, "Cereb"]
+		
+            }
+        },
+        { // DEEP
+            "name": "MSTransform",
+            "attributes":
+            {
+                "p": 0.8,
+                "nb_sclerosis": [3, 6], 
+                "lesion_label": "Lesion",
+                "sclerosis_size": [8, 50],
+                "background_value": 0,
+                "random_field_mask": "bidirectional",
+                "labels_to_target" : ["Striatum", "Thal", "MTL"]
+		
+            }
+        }
+
+	
+    ],
+    "val_transforms": []
+}
+
+
+
+
+

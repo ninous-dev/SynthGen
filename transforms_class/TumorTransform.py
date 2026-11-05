@@ -1,7 +1,5 @@
 import logging
-import os
 import random
-import uuid
 import numpy as np
 import torch
 import torchio as tio
@@ -11,9 +9,8 @@ from transforms_class.AnomalyLabelTransform import AnomalyLabelTransform
 from transforms_class.ZoomCenterTransform import ZoomCenterTransform
 from transforms_class.utils.lesions_tool_box import compute_coverage, get_biggest_component
 from transforms_class.utils.perlin_utils import generate_perlin_map, random_perlin_threshold
-from utils.logger import BLUE, GREEN, RED, RESET, YELLOW
+from utils.logger import BLUE, GREEN, RED, RESET, YELLOW, configure_logging
 from utils.random import random_probability
-import os.path as op
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +26,8 @@ class TumorTransform(AnomalyLabelTransform):
     ----------
     labels_to_target : Union[int, List[int]]
         Label(s) in the input image to target for tumor generation. The tumor will be generated in the vicinity of these labels.
-    lesion_label : int
-        The label value to assign to the generated tumor lesion in the output image.
+    lesion_labels : List[int]
+        List of 5 integers specifying the label values to use for the different tumor components in the output label image. The order should be [core, necrosis, ring, edema, edema_pnoise].
     tumor_size : Union[int, Tuple[int, int]], optional
         Desired size of the tumor core. If an int is provided, it is used as both the minimum and maximum size.
         If a tuple is provided, it should be (min_size, max_size). If None, no size constraint is applied.
@@ -52,8 +49,10 @@ class TumorTransform(AnomalyLabelTransform):
         List of label values in the input image that should be preserved during tumor generation. Default is None.
     labels_for_edema : Union[List[Union[int, str]], None], optional
         List of label values in the input image that can be included in the edema region. If None, edema can be generated around any label.
-    edema_pnoise_proba : float, optional
-        Probability of applying Perlin noise to the edema region to create more irregular shapes. Default is 0.5.
+    deformation_iteration_limit : int, optional
+        Maximum number of iterations to attempt finding a valid tumor core location. Default is 5.
+    p_edema_discretize_over_labels: bool, optional
+        Edema discretize over labels
 
     Attributes
     ----------
@@ -71,11 +70,17 @@ class TumorTransform(AnomalyLabelTransform):
         List of labels to preserve during tumor generation.
     labels_for_edema : Union[List[Union[int, str]], None]
         List of labels that can be included in the edema region.
+    verbose_dev : bool, optional
+        If True, enables verbose logging for development purposes. Default is True.
+    deformation_iteration_limit : int, optional
+        Maximum number of iterations to attempt finding a valid tumor core location. Default is 5.
+
+    TODO only one tumor is allowed by subject if we want to be sure that contrasted label work (else one tumor can have edema and the other not which will resul in a contrast forced with edema and core or enhance ring).
     """
     def __init__(
         self,
         labels_to_target: Union[int, List[int]],
-        lesion_label: int,
+        lesion_labels: List[int],
         tumor_size: Tuple[int] = None,
         edema_ratio: Union[float, Tuple[float, float]] = (1.2, 2.0),
         core_ratio: Union[float, Tuple[float, float]] = (1.2, 1.5),
@@ -85,12 +90,16 @@ class TumorTransform(AnomalyLabelTransform):
         necrosis_proba: float = 0.75,
         labels_to_keep: List[Union[int, str]] = None,
         labels_for_edema: List[Union[int, str]] = None,
-        edema_pnoise_proba: float = 0.5,
+        verbose_dev: bool = True,
+        deformation_iteration_limit: int = 5,
+        p_edema_discretize_over_labels: bool = False,
         **kwargs
     ):
-        self.lesion_label = lesion_label
+        self.lesion_labels = lesion_labels
         suffix = "Tumor"
         super().__init__(anomaly_suffix=suffix, **kwargs)
+        
+        configure_logging(dev_mode=verbose_dev, module_name=__name__)
         
         self.labels_to_target = AnomalyLabelTransform.int_to_list(labels_to_target)
         self.tumor_size = tumor_size
@@ -102,7 +111,8 @@ class TumorTransform(AnomalyLabelTransform):
         self.labels_for_edema = labels_for_edema
         self.core_ratio = core_ratio
         self.edema_ratio = edema_ratio
-        self.edema_pnoise_proba = edema_pnoise_proba
+        self.deformation_iteration_limit = deformation_iteration_limit
+        self.p_edema_discretize_over_labels = p_edema_discretize_over_labels
         
         # Perlin parameters
         self.perlin_args = {
@@ -115,20 +125,20 @@ class TumorTransform(AnomalyLabelTransform):
 
         self.args_names = [
             "labels_to_target",
-            "lesion_label",
+            "lesion_labels",
             "edema_proba",
             "necrosis_proba",
             "ring_around_core_proba",
-            "edema_pnoise_proba",
             "edema_ratio",
-            "core_ratio"
+            "core_ratio",
+            "p_edema_discretize_over_labels"
         ]
 
     def check_parameters(self):
         if self.tumor_size is not None:
             if isinstance(self.tumor_size, int):
                 self.tumor_size = (self.tumor_size, self.tumor_size)
-            elif isinstance(self.tumor_size, tuple) and len(self.tumor_size) == 2:
+            elif isinstance(self.tumor_size, tuple) and len(self.tumor_size) >= 2 and len(self.tumor_size) <= 3 and all(isinstance(x, int) for x in self.tumor_size):
                 if self.tumor_size[1] < self.tumor_size[0]:
                     raise ValueError(f"Invalid tumor_size range: {self.tumor_size}. The second value must be greater than or equal to the first.")
             else:
@@ -146,7 +156,7 @@ class TumorTransform(AnomalyLabelTransform):
 
     def get_contours(self, lesion_mask: np.ndarray) -> np.ndarray:
         """
-        Return a boolean mask of contour voxels for `lesion_label`.
+        Return a boolean mask of contour voxels for `lesion_labels`.
 
         Parameters
         ----------
@@ -192,11 +202,19 @@ class TumorTransform(AnomalyLabelTransform):
                 self.tumor_size[1],
                 self.labels_to_target,
                 random_max_sizes=False,
-                margin=0.6
+                margin=self.edema_ratio - 1.0 + 0.5 # margin added based on self.edema_ratio with a small buffer of 0.1 to ensure the core fits within the margin box
             )
 
-            if self.tumor_size[0] and (min(cropped_pure.shape) < self.tumor_size[0]):
-                logger.warning("%s box too small (%s < %s), retrying... %s" % (YELLOW, cropped_pure.shape, self.tumor_size[0], RESET))
+            if len(self.tumor_size) == 3:
+                min_of_max = max(cropped_pure.shape) > self.tumor_size[2]
+            else:
+                min_of_max = True
+
+            if self.tumor_size[0] and ((min(cropped_pure.shape) < self.tumor_size[0]) or not min_of_max):
+                if not min_of_max:
+                    logger.warning("%s[TumorTransform]%s Box too small (%s > %s), retrying..." % (YELLOW, RESET, cropped_pure.shape, self.tumor_size[2]))
+                else:
+                    logger.warning("%s[TumorTransform]%s Box too small (%s < %s), retrying..." % (YELLOW, RESET, cropped_pure.shape, self.tumor_size[0]))
                 continue
             logger.info(f"{BLUE}[TumorTransform]{RESET} Box size: {BLUE}{cropped_pure.shape}{RESET}")
 
@@ -250,40 +268,85 @@ class TumorTransform(AnomalyLabelTransform):
         torch.Tensor
             A new tensor with lesion labels added to the original label image tensor.
         """
+        lesions = []
+
         # Define the mapping of lesion components to their respective label values
-        lesion_label_names = {
-            "tumor_core": self.lesion_label,
-            "tumor_necrosis": self.lesion_label + 1,
-            "tumor_enhanced_ring": self.lesion_label + 2,
-        }
-        
-        # Add the main tumor core label to the target locations
         target_mask = torch.isin(label_image_tensor, torch.tensor(self.labels_to_target))
+        connected_components = get_biggest_component((lesion_label_full > 0).squeeze()).unsqueeze(0)
+        lesion_label_full = torch.where(connected_components > 0, lesion_label_full, 0)
 
         tumor_without_edema_label = torch.where(lesion_label_full <= 3, lesion_label_full, 0)
         tumor_without_edema_label = torch.where(get_biggest_component((tumor_without_edema_label > 0).squeeze()).unsqueeze(0) > 0, tumor_without_edema_label, 0)
 
-        result = torch.where(target_mask & (tumor_without_edema_label > 0), tumor_without_edema_label + self.lesion_label - 1, label_image_tensor)
+        result = label_image_tensor.clone()
+        for lesion_value in tumor_without_edema_label.unique():
+            if lesion_value == 0:
+                continue
+            lesion_value = int(lesion_value.item())
+            lesion_part_value = self.lesion_labels[lesion_value-1]
+            lesions.append(lesion_part_value)
+            result = torch.where(target_mask & (tumor_without_edema_label == lesion_value), lesion_part_value, result)
+            if lesion_value == 1 or lesion_value == 2:  # if core or enhanced ring is generated
+                contrasted_labels = [lesion_part_value]
 
         # Add edema label if edema is generated
         if self.edema_proba:
-            lesion_label_names["tumor_edema"] = self.lesion_label + 3
-            if self.edema_pnoise_proba:
-                lesion_label_names["tumor_edema_pnoise"] = self.lesion_label + 4
-
             edema_mask = torch.isin(label_image_tensor, torch.tensor(self.labels_for_edema))
             edema_label = torch.where(lesion_label_full > 3, lesion_label_full, 0)
-            result = torch.where(edema_mask & (edema_label > 0), edema_label + self.lesion_label - 1, result)
-        return result, lesion_label_names
+            
+            # Compute edema values for each edema_label and original_edema_labels key to avoid conflicts
+            edema_discretize_over_labels = random_probability(self.p_edema_discretize_over_labels)
+            for i in edema_label.unique():
+                if i == 0:
+                    continue
+                i = int(i.item())
+                if not edema_discretize_over_labels:
+                    result = torch.where(
+                        edema_mask & (edema_label == i),
+                        lesion_part_value,
+                        result
+                    )
+                    contrasted_labels = [lesion_part_value]
+                    lesions.append(lesion_part_value)
+
+                elif hasattr(self, "original_edema_labels"):
+                    edema_values_per_key_and_label = {}
+                    idx_sub_lesion = 0
+                    lesion_part_value = self.lesion_labels[i-1]
+
+                    for edema_label_idx, (label_key, resolved_labels) in enumerate(self.original_edema_labels.items()):
+                        if edema_label_idx == 0:
+                            edema_value = lesion_part_value
+                            contrasted_labels = [edema_value]
+                        else:
+                            while True:
+                                edema_value = lesion_part_value + idx_sub_lesion
+                                if edema_value not in self.lesion_labels and edema_value not in result.unique() and edema_value not in edema_values_per_key_and_label.values():
+                                    break
+                                idx_sub_lesion += 1
+                            lesions.append(edema_value)
+                            contrasted_labels.append(edema_value)
+
+                        edema_values_per_key_and_label[(i, label_key)] = edema_value
+                        logger.info(f"[DEBUG] Pre-computed edema value for edema_label {i}, {label_key}: {edema_value}")
+                        idx_sub_lesion += 1
+                        
+                        for resolved_label in resolved_labels:
+                            result = torch.where(
+                                edema_mask & (label_image_tensor == resolved_label) & (edema_label == i),
+                                edema_value,
+                                result
+                            )
+                else:
+                    raise ValueError("original_edema_labels attribute is missing. Ensure it is set before calling add_lesion_labels.")
+                    
+        return result, lesions, contrasted_labels
 
     def prepare_tumor_generation_parameters(self) -> None:
-        if isinstance(self.lesion_label, list) and len(self.lesion_label) == 1:
-            self.lesion_label = self.lesion_label[0]
-
-        if not isinstance(self.lesion_label, int):
-            raise ValueError(
-                f"lesion_label must be an integer. Got {type(self.lesion_label)} with value {self.lesion_label}."
-            )
+        if not isinstance(self.lesion_labels, list):
+            raise ValueError("Lesion labels must be a list.")
+        
+        self.lesion_labels = sorted(self.lesion_labels)
 
         self.edema_ratio = self.resolve_random_ratio(self.edema_ratio)
         self.core_ratio = self.resolve_random_ratio(self.core_ratio)
@@ -291,6 +354,7 @@ class TumorTransform(AnomalyLabelTransform):
         logger.info(f"{BLUE}[TumorTransform]{RESET} Starting tumor generation with parameters:")
         logger.info(f"{BLUE}[TumorTransform]{RESET} Edema ratio: {BLUE}{self.edema_ratio}{RESET}")
         logger.info(f"{BLUE}[TumorTransform]{RESET} Core ratio: {BLUE}{self.core_ratio}{RESET}")
+        logger.info(f"{BLUE}[TumorTransform]{RESET} Lesion labels: {BLUE}{self.lesion_labels}{RESET}")
 
     def deform_and_scale_core(self, core: torch.Tensor, spacing: Union[int, float]) -> torch.Tensor:
         """
@@ -368,7 +432,7 @@ class TumorTransform(AnomalyLabelTransform):
             base=random.randint(0, 100),
         )
         perlin_map = (perlin_map - perlin_map.min()) / (perlin_map.max() - perlin_map.min())
-        threshold = random.uniform(0.25, 0.5)
+        threshold = random.uniform(0.3, 0.7)
 
         return (perlin_map > threshold) & core.bool().cpu().numpy()
 
@@ -416,7 +480,7 @@ class TumorTransform(AnomalyLabelTransform):
             scale=self.perlin_args["scale"],
             octaves=self.perlin_args["octaves"],
             dilation=self.perlin_args["dilation"],
-            perlin_threshold=random_perlin_threshold(),
+            perlin_threshold=random_perlin_threshold(end=0.75, step=0.05, start=0.25),
         )
 
     def generate_edema_mask(
@@ -457,21 +521,6 @@ class TumorTransform(AnomalyLabelTransform):
             displacement=1
         )
         edema_mask = ZoomCenterTransform.apply_to_tensor(edema_mask, ratio=self.edema_ratio)
-
-        self.edema_pnoise_proba = random_probability(self.edema_pnoise_proba)
-        if self.edema_pnoise_proba:
-            perlin_map = generate_perlin_map(
-                edema_mask.squeeze(0).shape,
-                scale=self.perlin_args["scale"],
-                octaves=self.perlin_args["octaves"],
-                lacunarity=self.perlin_args["lacunarity"],
-                base=random.randint(0, 100),
-            )
-            perlin_map = (perlin_map - perlin_map.min()) / (perlin_map.max() - perlin_map.min())
-            threshold = random.uniform(0.25, 0.5)
-            perlin_mask = torch.from_numpy(perlin_map > threshold).int()
-            edema_mask = edema_mask.int()
-            edema_mask = edema_mask + (perlin_mask * edema_mask)
 
 
         # if no overlap between edema and core, we consider that edema generation failed and we return an empty mask
@@ -556,7 +605,10 @@ class TumorTransform(AnomalyLabelTransform):
         tio.Subject
             The transformed subject.
         """
+        logger.info("%s[TumorTransform]%s Started", GREEN, RESET)
+
         self.prepare_tumor_generation_parameters()
+
         nb_images_processed = 0
         # Apply the transform to each image in the subject
         for image_name, tio_image in self.get_images_dict(subject).items():
@@ -617,24 +669,23 @@ class TumorTransform(AnomalyLabelTransform):
                 start_indices=start_indices,
                 end_indices=end_indices,
             )
+            # save using torchio
             logger.info(f"{BLUE}[TumorTransform]{RESET} Core, necrosis, enhanced ring and edema generated. {GREEN}Aggregating tumor components.{RESET}")
 
             tumor_without_edema = torch.where(lesion_label_full <= 3, lesion_label_full , 0)
-            tumor_without_edema = torch.where(torch.isin(tio_image.data, torch.tensor(self.labels_to_keep)), 0, tumor_without_edema)
             
             # Get lesion label in label image referential
             new_label_image = tio_image.data.clone()
-            
-            deformation_iteration_limit = 5
-            deformation_iteration = 1
+
             displacement = 0.8
 
             grid_space = int(5 * 1/min(spacing)) # in mm
             minimal_coverage = 0.95
 
-            logger.info(f"{BLUE}[TumorTransform]{RESET} deformation_iteration_limit={BLUE}{deformation_iteration_limit}{RESET}")
+            logger.info(f"{BLUE}[TumorTransform]{RESET} deformation_iteration_limit={BLUE}{self.deformation_iteration_limit}{RESET}")
 
-            while deformation_iteration <= deformation_iteration_limit:
+            deformation_iteration = 1
+            while deformation_iteration <= self.deformation_iteration_limit:
                 logger.info("%s[TumorTransform]%s deformation iteration %s%d%s", BLUE, RESET, BLUE, deformation_iteration, RESET)
 
                 target_mask = torch.isin(new_label_image, torch.tensor(self.labels_to_target))
@@ -644,7 +695,8 @@ class TumorTransform(AnomalyLabelTransform):
 
                 previous_coverage = compute_coverage(
                     torch.isin(new_label_image.squeeze(0), torch.tensor(self.labels_to_target)), 
-                    lesion_label_full.squeeze(0) > 0)
+                    tumor_without_edema.squeeze(0) > 0)
+                
                 logger.info(f"{BLUE}[TumorTransform]{RESET} Current coverage: {YELLOW}{previous_coverage}{RESET}")
 
                 # Deform the label image
@@ -658,38 +710,39 @@ class TumorTransform(AnomalyLabelTransform):
                     labels_to_target=self.labels_to_target,
                     attention_mask=target_lesion_mask_labelmap,
                     target_point=position,
-                    keep_dilation=5, #TODO definir sans magic number
+                    keep_dilation=int(5 * 1/min(spacing)) # in mm
                 )
 
                 current_coverage = compute_coverage(
                     torch.isin(deformed_label_image.squeeze(0), torch.tensor(self.labels_to_target)),
-                    lesion_label_full.squeeze() > 0)
+                    tumor_without_edema.squeeze(0) > 0)
+                
                 logger.info(f"{BLUE}[TumorTransform]{RESET} Coverage after deformation: {YELLOW}{current_coverage}{RESET}")
 
                 if current_coverage > minimal_coverage:
-                    print(f"{GREEN}Inside is good after deformation got {current_coverage} > {minimal_coverage}. Stopping deformation process.{RESET}")
+                    logger.info(f"{BLUE}[TumorTransform]{RESET} Inside is good after deformation got {current_coverage} > {minimal_coverage}. Stopping deformation process.")
                     new_label_image = deformed_label_image
                     break
 
                 diff = current_coverage - previous_coverage
                 if (current_coverage <= previous_coverage):
-                    print(f"{RED}Inside did not improve after deformation got {current_coverage} <= {previous_coverage}. Stopping deformation process.{RESET}")
+                    logger.info(f"{RED}Inside did not improve after deformation got {current_coverage} <= {previous_coverage}. Stopping deformation process.{RESET}")
                     deformed_label_image = new_label_image
                     break
                 if current_coverage <= previous_coverage:
-                    print(f"{RED}Inside did not improve after deformation got {current_coverage} <= {previous_coverage}. Stopping deformation process.{RESET}")
+                    logger.info(f"{RED}Inside did not improve after deformation got {current_coverage} <= {previous_coverage}. Stopping deformation process.{RESET}")
                     break
                 if diff < 0.002:
-                    print(f"{YELLOW}Inside improvement is low after deformation got {current_coverage} <= {previous_coverage}. Stopping deformation process.{RESET}")
+                    logger.info(f"{YELLOW}Inside improvement is low after deformation got {current_coverage} <= {previous_coverage}. Stopping deformation process.{RESET}")
                     break
-                elif deformation_iteration >= deformation_iteration_limit:
-                    print(f"{YELLOW}Maximum number of deformations reached: {deformation_iteration}. Stopping deformation process.{RESET}")
+                elif deformation_iteration >= self.deformation_iteration_limit:
+                    logger.info(f"{YELLOW}Maximum number of deformations reached: {deformation_iteration}. Stopping deformation process.{RESET}")
                     break
                 deformation_iteration += 1
                 new_label_image = deformed_label_image
 
             # inside with tumor_full and new_label_image
-            current_coverage = compute_coverage(torch.isin(new_label_image.squeeze(0), torch.tensor(self.labels_to_target)), lesion_label_full.squeeze() > 0)
+            current_coverage = compute_coverage(torch.isin(new_label_image.squeeze(0), torch.tensor(self.labels_to_target)), tumor_without_edema.squeeze(0) > 0)
             if current_coverage < 0.95:
                 print(RED, f"Inside is still low after deformation process: {current_coverage}. Consider increasing the number of deformations or adjusting deformation parameters.", RESET)
 
@@ -698,13 +751,13 @@ class TumorTransform(AnomalyLabelTransform):
             # TODO Save label deformed without lesion TODO here we still have lesion labels in it ...
             subject.add_image(tio_image_no_lession, "__label_without_lesion")
 
-            result, lesion_label_names = self.add_lesion_labels(tio_image.data, lesion_label_full)
+            result, lesions, contrasted_labels = self.add_lesion_labels(tio_image.data, lesion_label_full)
             tio_image.set_data(result)
 
         # Add tumor informations to subject for logging and post processing
         subject["tumor_min_size"] = tumor_min_size
         subject["tumor_max_size"] = tumor_max_size
         
-        self.add_labels_names(subject, lesion_label_names)
+        self.add_labels_names(subject, lesions, contrasted_labels)
 
         return subject

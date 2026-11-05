@@ -2,18 +2,276 @@
 import pytest
 from unittest.mock import MagicMock
 import torchio as tio
-from transforms_class import RandomLabelsToImageOneConstraint
+from transforms_class import RandomLabelsToImageConstraint
 from utils.logger import GREEN, RESET
 
 
+def _make_transform(contrasted_labels=None, minimal_contrast=0.1, **kwargs):
+    """Factory with sensible defaults."""
+    t = RandomLabelsToImageConstraint(
+        minimal_contrast=minimal_contrast,
+        contrasted_labels=contrasted_labels,
+        default_mean=(0.0, 1.0),
+        default_std=(0.01, 0.1),
+        **kwargs,
+    )
+    t.get_params = MagicMock(return_value=(0.5, 0.1))
+    return t
 
-class TestRandomLabelsToImageOneConstraint:
-    """Test suite for RandomLabelsToImageOneConstraint"""
+
+class TestComputeLabelToDistinguish:
+    """Tests for compute_label_to_distinguish — the main public method."""
+
+    def test_no_constraint_returns_one_entry_per_label(self):
+        t = _make_transform()
+        means, stds = t.compute_label_to_distinguish([1, 2, 3, 4, 5])
+        assert len(means) == 5
+        assert len(stds) == 5
+
+    def test_no_constraint_uses_get_params(self):
+        t = _make_transform()
+        means, stds = t.compute_label_to_distinguish([1, 2, 3])
+        assert all(m == 0.5 for m in means)
+
+    def test_no_constraint_empty_labels(self):
+        t = _make_transform()
+        means, stds = t.compute_label_to_distinguish([])
+        assert means == [] and stds == []
+
+    def test_no_constraint_single_label(self):
+        t = _make_transform()
+        means, stds = t.compute_label_to_distinguish([7])
+        assert len(means) == 1 and means[0] == 0.5
+
+    def test_with_constraint_correct_number_of_means(self):
+        t = _make_transform(contrasted_labels={1: [10, 11], 2: [10, 11]})
+        means, stds = t.compute_label_to_distinguish([1, 2, 10, 11])
+        assert len(means) == 4
+
+    def test_with_constraint_respects_minimal_contrast(self):
+        """2-label case: algorithm ALWAYS has a valid candidate → guaranteed convergence."""
+        # With only 1 source and 1 target in [0, 1] and minimal_contrast=0.1,
+        # _find_best_position always finds a candidate (90% of range is valid).
+        # Run 10 times to cover different random initialisations.
+        for _ in range(10):
+            t = _make_transform(contrasted_labels={1: [10]})
+            labels = [1, 10]
+            means, _ = t.compute_label_to_distinguish(labels)
+            contrast = abs(means[0] - means[1])
+            assert contrast >= 0.1, (
+                f"source 1 vs target 10: contrast {contrast:.3f} < 0.1"
+            )
+
+    def test_with_multiple_constraint_groups(self):
+        t = _make_transform(contrasted_labels={1: [10, 11], 2: [10, 11], 3: [20, 21]})
+        means, stds = t.compute_label_to_distinguish([1, 2, 3, 10, 11, 20, 21])
+        assert len(means) == 7
+
+    def test_unconstrained_labels_get_default_mean(self):
+        # Label 5 is unconstrained — must use get_params (mocked to 0.5)
+        t = _make_transform(contrasted_labels={1: [10]})
+        labels = [1, 5, 10]
+        means, _ = t.compute_label_to_distinguish(labels)
+        idx5 = labels.index(5)
+        assert 0.0 <= means[idx5] <= 1.0
+
+    def test_all_means_in_default_mean_range(self):
+        t = _make_transform(contrasted_labels={1: [10], 2: [10]})
+        labels = [1, 2, 10]
+        means, _ = t.compute_label_to_distinguish(labels)
+        assert all(0.0 <= m <= 1.0 for m in means)
+
+    def test_variability_across_runs(self):
+        """Different runs should produce at least some variation."""
+        results = set()
+        for _ in range(8):
+            t = _make_transform(contrasted_labels={1: [10], 2: [10], 3: [10]})
+            labels = [1, 2, 3, 10]
+            means, _ = t.compute_label_to_distinguish(labels)
+            results.add(tuple(round(m, 2) for m in means))
+        assert len(results) > 1, "Expected variability across runs"
+
+
+class TestInitializeAllocation:
+    """_initialize_allocation must cover ALL labels and return (means, stds)."""
+
+    def _make(self):
+        return _make_transform(contrasted_labels={1: [10]})
+
+    def test_all_labels_present_in_means(self):
+        t = self._make()
+        label_set = {1, 5, 10, 42}
+        means, stds = t._initialize_allocation(label_set)
+        assert set(means.keys()) == label_set
+
+    def test_all_labels_present_in_stds(self):
+        t = self._make()
+        label_set = {1, 5, 10}
+        means, stds = t._initialize_allocation(label_set)
+        assert set(stds.keys()) == label_set
+
+    def test_values_in_range(self):
+        t = self._make()
+        means, stds = t._initialize_allocation({1, 2, 3, 10})
+        assert all(0.0 <= v <= 1.0 for v in means.values())
+
+    def test_empty_label_set_returns_empty_dicts(self):
+        t = self._make()
+        means, stds = t._initialize_allocation(set())
+        assert means == {} and stds == {}
+
+    def test_unconstrained_labels_also_initialised(self):
+        t = self._make()
+        means, stds = t._initialize_allocation({1, 10, 99})
+        assert 99 in means and 99 in stds
+
+
+class TestGroupLabelsByConstraints:
+    """Tests for _group_labels_by_constraints."""
+
+    def test_basic_grouping(self):
+        t = _make_transform(contrasted_labels={1: [10], 2: [10]})
+        groups = t._group_labels_by_constraints({1, 2, 10})
+        # Key is frozenset({10}), value is list of sources [1, 2]
+        key = frozenset([10])
+        assert key in groups
+        assert set(groups[key]) == {1, 2}
+
+    def test_labels_not_in_label_set_are_ignored(self):
+        # Source label 99 is not in label_set
+        t = _make_transform(contrasted_labels={1: [10], 99: [10]})
+        groups = t._group_labels_by_constraints({1, 10})
+        key = frozenset([10])
+        assert 99 not in groups.get(key, [])
+
+    def test_multiple_groups(self):
+        t = _make_transform(contrasted_labels={1: [10], 2: [20]})
+        groups = t._group_labels_by_constraints({1, 2, 10, 20})
+        assert frozenset([10]) in groups
+        assert frozenset([20]) in groups
+
+    def test_empty_label_set_gives_empty_groups(self):
+        t = _make_transform(contrasted_labels={1: [10]})
+        groups = t._group_labels_by_constraints(set())
+        assert groups == {}
+
+
+class TestGetConstraint:
+    """Tests for the unified _get_constraint method (role='target' or 'source')."""
+
+    def _groups(self):
+        # target key={10}, sources=[1, 2]
+        return {frozenset([10]): [1, 2]}
+
+    def test_role_target_returns_sources(self):
+        t = _make_transform(contrasted_labels={1: [10], 2: [10]})
+        result = t._get_constraint(10, self._groups(), role="target")
+        assert result == {1, 2}
+
+    def test_role_source_returns_targets(self):
+        t = _make_transform(contrasted_labels={1: [10], 2: [10]})
+        result = t._get_constraint(1, self._groups(), role="source")
+        assert result == {10}
+
+    def test_unknown_label_returns_empty_set(self):
+        t = _make_transform(contrasted_labels={1: [10]})
+        result = t._get_constraint(99, self._groups(), role="target")
+        assert result == set()
+
+    def test_role_source_unknown_returns_empty_set(self):
+        t = _make_transform(contrasted_labels={1: [10]})
+        result = t._get_constraint(99, self._groups(), role="source")
+        assert result == set()
+
+
+class TestDetectBlockingLabels:
+    """Tests for _detect_blocking_labels."""
+
+    def test_detects_violation(self):
+        t = _make_transform(contrasted_labels={1: [10]})
+        groups = {frozenset([10]): [1]}
+        # Both at 0.5 → contrast 0.0 < 0.1
+        blocking = t._detect_blocking_labels({1: 0.5, 10: 0.5}, groups)
+        assert len(blocking) == 1
+        assert blocking[0][0] == 10  # target
+        assert blocking[0][1] == 1   # source
+
+    def test_no_violation_when_contrast_sufficient(self):
+        t = _make_transform(contrasted_labels={1: [10]})
+        groups = {frozenset([10]): [1]}
+        blocking = t._detect_blocking_labels({1: 0.0, 10: 0.9}, groups)
+        assert blocking == []
+
+    def test_multiple_violations(self):
+        t = _make_transform(contrasted_labels={1: [10], 2: [10]})
+        groups = {frozenset([10]): [1, 2]}
+        blocking = t._detect_blocking_labels({1: 0.5, 2: 0.5, 10: 0.5}, groups)
+        assert len(blocking) == 2
+
+
+class TestIsSolved:
+    """Tests for _is_solved."""
+
+    def test_empty_list_is_solved(self):
+        t = _make_transform()
+        assert t._is_solved([]) is True
+
+    def test_non_empty_list_is_not_solved(self):
+        t = _make_transform()
+        assert t._is_solved([(10, 1, 0.0)]) is False
+
+
+class TestFindBestPosition:
+    """Tests for _find_best_position."""
+
+    def test_result_in_range(self):
+        t = _make_transform()
+        alloc = {1: 0.5, 10: 0.5, 20: 0.8}
+        pos = t._find_best_position(10, alloc, constraint_labels={1})
+        assert 0.0 <= pos <= 1.0
+
+    def test_respects_minimal_contrast_with_constraint(self):
+        t = _make_transform()
+        alloc = {1: 0.5, 10: 0.5}
+        pos = t._find_best_position(10, alloc, constraint_labels={1})
+        assert abs(pos - alloc[1]) >= 0.1
+
+    def test_no_constraint_still_returns_valid_value(self):
+        t = _make_transform()
+        alloc = {1: 0.3, 10: 0.3}
+        pos = t._find_best_position(10, alloc, constraint_labels=set())
+        assert 0.0 <= pos <= 1.0
+
+
+class TestResolveAnatomy:
+    """Tests for resolve_anatomy."""
+
+    def test_string_keys_are_resolved(self):
+        t = _make_transform(contrasted_labels={"WM": ["GM"]})
+        t.resolve_anatomy({"WM": 1, "GM": 2})
+        assert 1 in t.contrasted_labels
+        assert t.contrasted_labels[1] == [2]
+
+    def test_already_int_keys_unchanged(self):
+        t = _make_transform(contrasted_labels={1: [2]})
+        t.resolve_anatomy({"WM": 1, "GM": 2})
+        assert 1 in t.contrasted_labels
+
+    def test_none_contrasted_labels_is_noop(self):
+        t = _make_transform(contrasted_labels=None)
+        t.resolve_anatomy({"WM": 1})  # must not raise
+        assert t.contrasted_labels is None
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])
+
+    """Test suite for RandomLabelsToImageConstraint"""
     
     @pytest.fixture
     def mock_transform(self):
         """Fixture to create a real instance"""
-        transform = RandomLabelsToImageOneConstraint(
+        transform = RandomLabelsToImageConstraint(
             minimal_contrast=0.1,
             contrasted_labels=None,
             default_mean=(0.0, 1.0),
@@ -62,7 +320,7 @@ class TestRandomLabelsToImageOneConstraint:
     # ========================================================================
     def test_with_constraint_no_max_zones(self):
         """Test with constraint, without max_zones (auto mode)"""
-        transform = RandomLabelsToImageOneConstraint(
+        transform = RandomLabelsToImageConstraint(
             minimal_contrast=0.1,
             contrasted_labels={1: [10, 11], 2: [10, 11], 3: [10, 11]},
             default_mean=(0.0, 1.0),
@@ -86,7 +344,7 @@ class TestRandomLabelsToImageOneConstraint:
     
     def test_with_constraint_multiple_groups(self):
         """Test with multiple constraint groups"""
-        transform = RandomLabelsToImageOneConstraint(
+        transform = RandomLabelsToImageConstraint(
             minimal_contrast=0.1,
             contrasted_labels={
                 1: [10, 11],
@@ -109,7 +367,7 @@ class TestRandomLabelsToImageOneConstraint:
     # ========================================================================
     def test_with_constraint_and_max_zones(self):
         """Test with constraint and defined max_zones"""
-        transform = RandomLabelsToImageOneConstraint(
+        transform = RandomLabelsToImageConstraint(
             minimal_contrast=0.1,
             max_zones=3,
             contrasted_labels={1: [10, 11], 2: [10, 11], 3: [10, 11]},
@@ -137,7 +395,7 @@ class TestRandomLabelsToImageOneConstraint:
         """Test that max_zones really reduces clustering"""
         
         def run_with_max_zones(max_zones):
-            transform = RandomLabelsToImageOneConstraint(
+            transform = RandomLabelsToImageConstraint(
                 minimal_contrast=0.05,
                 max_zones=max_zones,
                 contrasted_labels={1: [10], 2: [10], 3: [10], 4: [10]},
@@ -167,7 +425,7 @@ class TestRandomLabelsToImageOneConstraint:
     # ========================================================================
     def test_zones_do_not_merge(self):
         """Test that created zones do not overlap"""
-        transform = RandomLabelsToImageOneConstraint(
+        transform = RandomLabelsToImageConstraint(
             minimal_contrast=0.1,
             max_zones=5,
             contrasted_labels={1: [20], 2: [20], 3: [20], 4: [20], 5: [20]},
@@ -199,7 +457,7 @@ class TestRandomLabelsToImageOneConstraint:
     # ========================================================================
     def test_not_all_zones_used(self):
         """Test that when sources < num_zones, some zones remain free"""
-        transform = RandomLabelsToImageOneConstraint(
+        transform = RandomLabelsToImageConstraint(
             minimal_contrast=0.1,
             max_zones=10,  # 10 possible zones
             contrasted_labels={1: [20], 2: [20]},  # But only 2 sources
@@ -233,7 +491,7 @@ class TestRandomLabelsToImageOneConstraint:
     # ========================================================================
     def test_sources_and_targets_in_different_zones(self):
         """Test that sources and targets are allocated correctly (separate zones)"""
-        transform = RandomLabelsToImageOneConstraint(
+        transform = RandomLabelsToImageConstraint(
             minimal_contrast=0.15,
             max_zones=4,
             contrasted_labels={1: [10], 2: [10], 3: [10]},
@@ -265,7 +523,7 @@ class TestRandomLabelsToImageOneConstraint:
     # ========================================================================
     def test_constraint_with_single_source(self):
         """Test with one source and one target"""
-        transform = RandomLabelsToImageOneConstraint(
+        transform = RandomLabelsToImageConstraint(
             minimal_contrast=0.1,
             max_zones=2,
             contrasted_labels={1: [10]},
@@ -292,7 +550,7 @@ class TestRandomLabelsToImageOneConstraint:
 
     def test_constraint_with_multiple_targets(self):
         """Test with multiple targets"""
-        transform = RandomLabelsToImageOneConstraint(
+        transform = RandomLabelsToImageConstraint(
             minimal_contrast=0.1,
             contrasted_labels={1: [20, 21, 22]},
             default_mean=(0.0, 1.0),
@@ -308,7 +566,7 @@ class TestRandomLabelsToImageOneConstraint:
     
     def test_max_zones_zero(self):
         """Test edge case: max_zones = 0"""
-        transform = RandomLabelsToImageOneConstraint(
+        transform = RandomLabelsToImageConstraint(
             minimal_contrast=0.1,
             max_zones=0,
             contrasted_labels={1: [10]},
@@ -326,7 +584,7 @@ class TestRandomLabelsToImageOneConstraint:
     
     def test_max_zones_one(self):
         """Test with max_zones=1 (ultra-clustered)"""
-        transform = RandomLabelsToImageOneConstraint(
+        transform = RandomLabelsToImageConstraint(
             minimal_contrast=0.1,
             max_zones=1,
             contrasted_labels={1: [20], 2: [20], 3: [20]},
@@ -353,7 +611,7 @@ class TestRandomLabelsToImageOneConstraint:
         results = []
         
         for run in range(5):
-            transform = RandomLabelsToImageOneConstraint(
+            transform = RandomLabelsToImageConstraint(
                 minimal_contrast=0.1,
                 max_zones=3,
                 contrasted_labels={1: [10], 2: [10], 3: [10]},
@@ -374,7 +632,7 @@ class TestRandomLabelsToImageOneConstraint:
     
     def test_unconstrained_labels_ignored(self):
         """Test that unconstrained labels use default_mean"""
-        transform = RandomLabelsToImageOneConstraint(
+        transform = RandomLabelsToImageConstraint(
             minimal_contrast=0.1,
             contrasted_labels={1: [10]},
             default_mean=(0.0, 1.0),
@@ -408,7 +666,7 @@ class TestRandomLabelsToImageOneConstraint:
 
     def test_merge_zones(self):
         """Test the _merge_zones function"""
-        transform = RandomLabelsToImageOneConstraint(
+        transform = RandomLabelsToImageConstraint(
             minimal_contrast=0.1,
             default_mean=(0.0, 1.0),
             default_std=(0.01, 0.1),

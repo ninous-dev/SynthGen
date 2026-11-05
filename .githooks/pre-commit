@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Pre-commit hook — runs the testsuite in the ptorch23 conda environment.
+# Install once with:  bash install_hooks.sh
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Environment setup (mirrors jobs_run_cluster/env.sh)
+# ---------------------------------------------------------------------------
+CONDA_INIT=/network/iss/cenir/software/irm/conda-forge/etc/profile.d/conda.sh
+
+if [[ ! -f "$CONDA_INIT" ]]; then
+    echo "[pre-commit] ERROR: conda init script not found: $CONDA_INIT" >&2
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$CONDA_INIT"
+conda activate ptorch23
+
+SOFT_PATH=/network/iss/cenir/software/irm/
+export PYTHONPATH="${SOFT_PATH}toolbox_python/torchio/src:${PYTHONPATH:-}"
+export ROOT_PROG=/network/iss/cenir/analyse/irm/users/ines.khemir/synth_v5.0/Synthetic-mri-generator
+
+# ---------------------------------------------------------------------------
+# Run testsuite
+# ---------------------------------------------------------------------------
+echo ""
+echo "╔══════════════════════════════════════╗"
+echo "║  Pre-commit: running testsuite ...   ║"
+echo "╚══════════════════════════════════════╝"
+
+cd "$ROOT_PROG"
+python -m pytest testsuite/ -v --tb=short -q \
+    --cov=transforms_class \
+    --cov-report=term-missing \
+    --cov-report=html:coverage_html
+
+EXIT_CODE=$?
+
+if [[ $EXIT_CODE -ne 0 ]]; then
+    echo ""
+    echo "[pre-commit] ✗ Tests FAILED — commit aborted." >&2
+    exit 1
+fi
+
+echo ""
+echo "[pre-commit] ✓ All tests passed — proceeding with commit."

@@ -6,10 +6,13 @@ from .LabelTransform import LabelTransform
 from .MSTransform import MSTransform
 from .OneHotTransform import OneHotTransform
 from .PeriventricularMS import PeriventricularMS
-from .RandomLabelsToImageOneConstraint import RandomLabelsToImageOneConstraint
+from .RandomLabelsToImageConstraint import RandomLabelsToImageConstraint
 from .RandomMorphologyTransform import RandomMorphologyTransform
+from .transformPipeline import TransformPipeline
 from .TumorTransform import TumorTransform
 from .ZoomCenterTransform import ZoomCenterTransform
+from .RandomRotatedBox import RandomRotatedBox
+from .RandomPerlinIntensity import RandomPerlinIntensity
 
 __all__ = [
     "AnomalyLabelTransform",
@@ -19,8 +22,11 @@ __all__ = [
     "MSTransform",
     "OneHotTransform",
     "PeriventricularMS",
-    "RandomLabelsToImageOneConstraint",
+    "RandomLabelsToImageConstraint",
     "RandomMorphologyTransform",
+    "TransformPipeline",
     "TumorTransform",
     "ZoomCenterTransform",
+    "RandomRotatedBox",
+    "RandomPerlinIntensity"
 ]

@@ -32,7 +32,9 @@ def generate_perlin_map(
     scale: float = 20.0,
     octaves: int = 4,
     lacunarity: float = 2.0,
-    base: int = 0
+    base: int = 0,
+    threshold: float | None = None,
+    normalize: bool = False
 ) -> torch.Tensor:
     """
     Generate a Perlin noise map.
@@ -49,6 +51,10 @@ def generate_perlin_map(
         Frequency multiplier between octaves, by default=2.0.
     base : int, optional
         Seed for noise generation, by default=0.
+    threshold : float | None, optional
+        If provided, values below this threshold will be set to 0, by default=None.
+    normalize : bool, optional
+        If True, normalize the noise to [0, 1], by default=False.
 
     Returns
     -------
@@ -72,5 +78,12 @@ def generate_perlin_map(
         repeatz=1024,
         base=base
     ), otypes=[np.float32])
+    
+    perlin_result = pnoise3_vec(x, y, z)
+    if threshold is not None:
+        perlin_result[perlin_result < threshold] = 0
+        
+    if normalize:
+        perlin_result = (perlin_result - perlin_result.min()) / (perlin_result.max() - perlin_result.min() + 1e-8)
 
-    return pnoise3_vec(x, y, z)
+    return perlin_result

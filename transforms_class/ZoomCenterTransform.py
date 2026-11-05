@@ -6,7 +6,7 @@ from scipy.ndimage import center_of_mass
 from transforms_class.LabelTransform import LabelTransform
 import SimpleITK as sitk
 
-from utils.logger import BLUE, RESET
+from utils.logger import BLUE, RESET, configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -23,17 +23,23 @@ class ZoomCenterTransform(LabelTransform):
     ratio : float
         The scaling factor to apply. Values >1 zoom in (enlarge), values <1 zoom out (shrink).
 
+    verbose_dev : bool, optional
+        If True, enables verbose logging for development purposes. Default is True.
+
     Attributes
     ----------
     ratio : float
         The scaling factor used for the zoom transformation.
     """
 
-    def __init__(self, ratio: float, **kwargs):
+    def __init__(self, ratio: float, verbose_dev: bool = True, **kwargs):
         super().__init__(**kwargs)
+        configure_logging(dev_mode=verbose_dev, module_name=__name__)
+
         self.ratio = ratio
         
     def apply_transform(self, subject: tio.Subject) -> tio.Subject:
+        logger.info("%s[ZoomCenterTransform]%s Started", BLUE, RESET)
         for name, image in subject.items():
             if not isinstance(image, tio.LabelMap):
                 continue

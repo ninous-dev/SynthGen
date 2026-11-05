@@ -5,7 +5,7 @@ from torchio import Subject
 from scipy.ndimage import binary_dilation, generate_binary_structure
 
 from transforms_class.LabelTransform import LabelTransform
-from utils.logger import BLUE, RESET
+from utils.logger import BLUE, RESET, configure_logging
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -27,9 +27,12 @@ class RandomMorphologyTransform(LabelTransform):
         nb_iter_max: int = 2,
         transform_suffix: str = "dil",
         label_within_delete: str = None,
+        verbose_dev: bool = True,
         **kwargs
     ):
         super().__init__(p=p, **kwargs)
+        configure_logging(dev_mode=verbose_dev, module_name=__name__)
+
 
         self.nb_iter_min = nb_iter_min
         self.nb_iter_max = nb_iter_max
